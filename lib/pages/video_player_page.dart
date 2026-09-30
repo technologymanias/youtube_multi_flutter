@@ -176,11 +176,18 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (widget.thumbnailUrl != null)
+                  if (widget.videoId.isNotEmpty)
                     ClipRRect(
                       borderRadius: BorderRadius.circular(8),
-                      child: Image.network(widget.thumbnailUrl!,
-                          height: 200, fit: BoxFit.cover),
+                      child: Image.network(
+                        'https://img.youtube.com/vi/${widget.videoId}/maxresdefault.jpg',
+                        height: 200, fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => Image.network(
+                          'https://img.youtube.com/vi/${widget.videoId}/hqdefault.jpg',
+                          height: 200, fit: BoxFit.cover,
+                          errorBuilder: (_, __, ___) => const SizedBox(height: 200),
+                        ),
+                      ),
                     ),
                   const SizedBox(height: 24),
                   const CircularProgressIndicator(),

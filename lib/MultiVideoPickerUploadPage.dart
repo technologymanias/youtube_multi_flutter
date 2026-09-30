@@ -41,6 +41,7 @@ class _MultiVideoPickerUploadPageState extends State<MultiVideoPickerUploadPage>
   List<String> _uploadDates = [];
   bool _loading = false;
   bool _syncingYoutube = false;
+  bool _isDisposed = false;
   int _todayUploadCount = 0;
   final ScrollController _scrollController = ScrollController();
   String _currentHeaderDate = '';
@@ -57,6 +58,7 @@ class _MultiVideoPickerUploadPageState extends State<MultiVideoPickerUploadPage>
 
   @override
   void dispose() {
+    _isDisposed = true;
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     super.dispose();
@@ -161,6 +163,17 @@ class _MultiVideoPickerUploadPageState extends State<MultiVideoPickerUploadPage>
         _currentHeaderDate = DateFormat('MMM d, yyyy').format(uniqueVideos.first.createDateTime);
       }
     });
+  }
+
+  Future<Uint8List?> _safeThumbnail(AssetEntity video) async {
+    if (_isDisposed) return null;
+    try {
+      final data = await video.thumbnailDataWithSize(const ThumbnailSize(200, 200));
+      if (_isDisposed) return null;
+      return data;
+    } catch (_) {
+      return null;
+    }
   }
 
   bool _isOnYoutube(AssetEntity video) {
@@ -402,7 +415,7 @@ await _storage.write(key: 'uploadedVideoIds', value: jsonEncode(_uploadedVideoId
       child: Stack(
         children: [
           FutureBuilder<Uint8List?>(
-            future: video.thumbnailDataWithSize(ThumbnailSize(200, 200)),
+            future: _safeThumbnail(video),
             builder: (_, snap) => snap.hasData
                 ? Image.memory(snap.data!, fit: BoxFit.cover, width: double.infinity, height: double.infinity)
                 : Container(color: Colors.grey[300]),

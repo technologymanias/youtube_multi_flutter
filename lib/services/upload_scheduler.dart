@@ -7,6 +7,8 @@ import 'background_service.dart';
 
 enum JobStatus { pending, uploading, completed, failed, scheduled }
 
+enum UploadDestination { youtube, telegram, both }
+
 class UploadJob {
   final String id;
   final String assetId;
@@ -17,9 +19,13 @@ class UploadJob {
   DateTime? scheduledDate;
   DateTime? completedAt;
   String? youtubeVideoId;
+  String? telegramMessageId;
   String? error;
+  String? statusMessage;
   String channelId;
   String accountEmail;
+  UploadDestination destination;
+  String? folder;
 
   UploadJob({
     required this.id,
@@ -31,9 +37,13 @@ class UploadJob {
     this.scheduledDate,
     this.completedAt,
     this.youtubeVideoId,
+    this.telegramMessageId,
     this.error,
+    this.statusMessage,
     this.channelId = '',
     this.accountEmail = '',
+    this.destination = UploadDestination.youtube,
+    this.folder,
   });
 
   Map<String, dynamic> toJson() => {
@@ -46,9 +56,13 @@ class UploadJob {
     'scheduledDate': scheduledDate?.toIso8601String(),
     'completedAt': completedAt?.toIso8601String(),
     'youtubeVideoId': youtubeVideoId,
+    'telegramMessageId': telegramMessageId,
     'error': error,
+    'statusMessage': statusMessage,
     'channelId': channelId,
     'accountEmail': accountEmail,
+    'destination': destination.index,
+    'folder': folder,
   };
 
   factory UploadJob.fromJson(Map<String, dynamic> json) => UploadJob(
@@ -61,21 +75,40 @@ class UploadJob {
     scheduledDate: json['scheduledDate'] != null ? DateTime.parse(json['scheduledDate'] as String) : null,
     completedAt: json['completedAt'] != null ? DateTime.parse(json['completedAt'] as String) : null,
     youtubeVideoId: json['youtubeVideoId'] as String?,
+    telegramMessageId: json['telegramMessageId'] as String?,
     error: json['error'] as String?,
+    statusMessage: json['statusMessage'] as String?,
     channelId: json['channelId'] as String? ?? '',
     accountEmail: json['accountEmail'] as String? ?? '',
+    destination: json['destination'] != null
+        ? UploadDestination.values[json['destination'] as int]
+        : UploadDestination.youtube,
+    folder: json['folder'] as String?,
   );
 
   String get displayName =>
       title.isNotEmpty ? title : (filePath != null ? filePath!.split('/').last : assetId);
+
+  bool get uploadedToYoutube => destination == UploadDestination.youtube || destination == UploadDestination.both;
+  bool get uploadedToTelegram => destination == UploadDestination.telegram || destination == UploadDestination.both;
 }
 
 class UploadScheduler extends ChangeNotifier {
-  static const int dailyLimit = 15;
+  static const int youtubeDailyLimit = 15;
   static const String _storageKey = 'upload_queue';
   static const _storage = FlutterSecureStorage();
 
   List<UploadJob> _jobs = [];
+  DateTime _lastUiNotify = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// Progress/status updates fire for every upload chunk; notifying the UI on
+  /// each one saturates the main isolate, so these are rate-limited.
+  void _notifyThrottled({int minIntervalMs = 300}) {
+    final now = DateTime.now();
+    if (now.difference(_lastUiNotify).inMilliseconds < minIntervalMs) return;
+    _lastUiNotify = now;
+    notifyListeners();
+  }
 
   List<UploadJob> get jobs => List.unmodifiable(_jobs);
   int get totalCount => _jobs.length;
@@ -85,22 +118,34 @@ class UploadScheduler extends ChangeNotifier {
   int get completedCount => _jobs.where((j) => j.status == JobStatus.completed).length;
   int get failedCount => _jobs.where((j) => j.status == JobStatus.failed).length;
 
-  int get todayUploadedCount {
+  int get todayYoutubeUploadedCount {
     final today = DateTime.now().toIso8601String().substring(0, 10);
     return _jobs.where((j) =>
       j.status == JobStatus.completed &&
       j.completedAt != null &&
-      j.completedAt!.toIso8601String().substring(0, 10) == today
+      j.completedAt!.toIso8601String().substring(0, 10) == today &&
+      j.destination == UploadDestination.youtube
     ).length;
   }
 
-  int todayUploadedCountForChannel(String channelId) {
+  int get todayTelegramUploadedCount {
+    final today = DateTime.now().toIso8601String().substring(0, 10);
+    return _jobs.where((j) =>
+      j.status == JobStatus.completed &&
+      j.completedAt != null &&
+      j.completedAt!.toIso8601String().substring(0, 10) == today &&
+      j.destination == UploadDestination.telegram
+    ).length;
+  }
+
+  int todayYoutubeUploadedCountForChannel(String channelId) {
     final today = DateTime.now().toIso8601String().substring(0, 10);
     return _jobs.where((j) =>
       j.channelId == channelId &&
       j.status == JobStatus.completed &&
       j.completedAt != null &&
-      j.completedAt!.toIso8601String().substring(0, 10) == today
+      j.completedAt!.toIso8601String().substring(0, 10) == today &&
+      j.destination == UploadDestination.youtube
     ).length;
   }
 
@@ -153,53 +198,70 @@ class UploadScheduler extends ChangeNotifier {
     }
   }
 
-  Future<void> addJobs(List<Map<String, String>> videos, String channelId, String accountEmail) async {
+  Future<void> addJobs(List<Map<String, String>> videos, String channelId, String accountEmail, {UploadDestination destination = UploadDestination.youtube}) async {
     final today = DateTime.now();
-    final todayStr = today.toIso8601String().substring(0, 10);
 
-    // Count jobs already assigned to each date for this channel
-    final dateCounts = <String, int>{};
-    for (final j in _jobs.where((j) => j.channelId == channelId)) {
-      String dateKey;
-      if (j.status == JobStatus.completed && j.completedAt != null) {
-        dateKey = j.completedAt!.toIso8601String().substring(0, 10);
-      } else if (j.status == JobStatus.scheduled && j.scheduledDate != null) {
-        dateKey = j.scheduledDate!.toIso8601String().substring(0, 10);
-      } else if (j.status == JobStatus.pending && j.scheduledDate == null) {
-        dateKey = todayStr;
-      } else {
-        continue;
+    if (destination == UploadDestination.telegram) {
+      for (final video in videos) {
+        final job = UploadJob(
+          id: '${video['assetId']}_${DateTime.now().millisecondsSinceEpoch}_${_jobs.length}',
+          assetId: video['assetId']!,
+          title: video['title']!,
+          filePath: video['filePath'],
+          channelId: channelId,
+          accountEmail: accountEmail,
+          destination: destination,
+        );
+        _jobs.add(job);
       }
-      dateCounts[dateKey] = (dateCounts[dateKey] ?? 0) + 1;
-    }
+    } else {
+      final todayStr = today.toIso8601String().substring(0, 10);
 
-    int dayOffset = 0;
-    for (final video in videos) {
-      while (true) {
-        final dateKey = today.add(Duration(days: dayOffset)).toIso8601String().substring(0, 10);
-        final count = dateCounts[dateKey] ?? 0;
-        if (count < dailyLimit) {
-          dateCounts[dateKey] = count + 1;
-          break;
+      // Count YouTube jobs already assigned to each date for this channel
+      final dateCounts = <String, int>{};
+      for (final j in _jobs.where((j) => j.channelId == channelId && j.destination == UploadDestination.youtube)) {
+        String dateKey;
+        if (j.status == JobStatus.completed && j.completedAt != null) {
+          dateKey = j.completedAt!.toIso8601String().substring(0, 10);
+        } else if (j.status == JobStatus.scheduled && j.scheduledDate != null) {
+          dateKey = j.scheduledDate!.toIso8601String().substring(0, 10);
+        } else if (j.status == JobStatus.pending && j.scheduledDate == null) {
+          dateKey = todayStr;
+        } else {
+          continue;
         }
-        dayOffset++;
+        dateCounts[dateKey] = (dateCounts[dateKey] ?? 0) + 1;
       }
 
-      final job = UploadJob(
-        id: '${video['assetId']}_${DateTime.now().millisecondsSinceEpoch}_${_jobs.length}',
-        assetId: video['assetId']!,
-        title: video['title']!,
-        filePath: video['filePath'],
-        channelId: channelId,
-        accountEmail: accountEmail,
-      );
+      int dayOffset = 0;
+      for (final video in videos) {
+        while (true) {
+          final dateKey = today.add(Duration(days: dayOffset)).toIso8601String().substring(0, 10);
+          final count = dateCounts[dateKey] ?? 0;
+          if (count < youtubeDailyLimit) {
+            dateCounts[dateKey] = count + 1;
+            break;
+          }
+          dayOffset++;
+        }
 
-      if (dayOffset > 0) {
-        job.status = JobStatus.scheduled;
-        job.scheduledDate = today.add(Duration(days: dayOffset));
+        final job = UploadJob(
+          id: '${video['assetId']}_${DateTime.now().millisecondsSinceEpoch}_${_jobs.length}',
+          assetId: video['assetId']!,
+          title: video['title']!,
+          filePath: video['filePath'],
+          channelId: channelId,
+          accountEmail: accountEmail,
+          destination: destination,
+        );
+
+        if (dayOffset > 0) {
+          job.status = JobStatus.scheduled;
+          job.scheduledDate = today.add(Duration(days: dayOffset));
+        }
+
+        _jobs.add(job);
       }
-
-      _jobs.add(job);
     }
     await _save();
     notifyListeners();
@@ -223,15 +285,24 @@ class UploadScheduler extends ChangeNotifier {
     final idx = _jobs.indexWhere((j) => j.id == id);
     if (idx == -1) return;
     _jobs[idx].progress = progress;
-    notifyListeners();
+    _notifyThrottled();
   }
 
-  Future<void> markCompleted(String id, String youtubeVideoId) async {
+  Future<void> setStatusMessage(String id, String message) async {
+    final idx = _jobs.indexWhere((j) => j.id == id);
+    if (idx == -1) return;
+    if (_jobs[idx].statusMessage == message) return;
+    _jobs[idx].statusMessage = message;
+    _notifyThrottled();
+  }
+
+  Future<void> markCompleted(String id, {String youtubeVideoId = '', String telegramMessageId = ''}) async {
     final idx = _jobs.indexWhere((j) => j.id == id);
     if (idx == -1) return;
     _jobs[idx].status = JobStatus.completed;
     _jobs[idx].progress = 1.0;
-    _jobs[idx].youtubeVideoId = youtubeVideoId;
+    if (youtubeVideoId.isNotEmpty) _jobs[idx].youtubeVideoId = youtubeVideoId;
+    if (telegramMessageId.isNotEmpty) _jobs[idx].telegramMessageId = telegramMessageId;
     _jobs[idx].completedAt = DateTime.now();
     await _save();
     notifyListeners();
@@ -286,7 +357,8 @@ class UploadScheduler extends ChangeNotifier {
       j.channelId == channelId &&
       j.status == JobStatus.completed &&
       j.completedAt != null &&
-      j.completedAt!.toIso8601String().substring(0, 10) == today
+      j.completedAt!.toIso8601String().substring(0, 10) == today &&
+      j.destination == UploadDestination.youtube
     ).length;
   }
 
@@ -322,4 +394,85 @@ class UploadScheduler extends ChangeNotifier {
 
   /// All scheduled jobs (for backward compatibility)
   Map<String, List<UploadJob>> get scheduledByDate => scheduledByDateForChannel(null);
+
+  List<UploadJob> get youtubeCompleted =>
+      _jobs.where((j) => j.status == JobStatus.completed && j.uploadedToYoutube).toList()
+        ..sort((a, b) => (b.completedAt ?? DateTime(0)).compareTo(a.completedAt ?? DateTime(0)));
+
+  List<UploadJob> get telegramCompleted =>
+      _jobs.where((j) => j.status == JobStatus.completed && j.uploadedToTelegram).toList()
+        ..sort((a, b) => (b.completedAt ?? DateTime(0)).compareTo(a.completedAt ?? DateTime(0)));
+
+  int get todayYoutubeCount {
+    final today = DateTime.now().toIso8601String().substring(0, 10);
+    return _jobs.where((j) =>
+      j.status == JobStatus.completed &&
+      j.completedAt != null &&
+      j.completedAt!.toIso8601String().substring(0, 10) == today &&
+      j.uploadedToYoutube
+    ).length;
+  }
+
+  int get todayTelegramCount {
+    final today = DateTime.now().toIso8601String().substring(0, 10);
+    return _jobs.where((j) =>
+      j.status == JobStatus.completed &&
+      j.completedAt != null &&
+      j.completedAt!.toIso8601String().substring(0, 10) == today &&
+      j.uploadedToTelegram
+    ).length;
+  }
+
+  List<String> get folders =>
+      _jobs.map((j) => j.folder).whereType<String>().where((f) => f.isNotEmpty).toSet().toList()..sort();
+
+  List<UploadJob> jobsInFolder(String folder) =>
+      _jobs.where((j) => j.folder == folder).toList();
+
+  Future<void> setFolder(String jobId, String? folder) async {
+    final idx = _jobs.indexWhere((j) => j.id == jobId);
+    if (idx == -1) return;
+    _jobs[idx].folder = folder;
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> rescheduleForLater(String jobId, DateTime date) async {
+    final idx = _jobs.indexWhere((j) => j.id == jobId);
+    if (idx == -1) return;
+    _jobs[idx].status = JobStatus.scheduled;
+    _jobs[idx].scheduledDate = date;
+    _jobs[idx].progress = 0;
+    await _save();
+    notifyListeners();
+  }
+
+  Future<void> resumePending(String jobId) async {
+    final idx = _jobs.indexWhere((j) => j.id == jobId);
+    if (idx == -1) return;
+    if (_jobs[idx].status == JobStatus.scheduled && _jobs[idx].scheduledDate != null) {
+      _jobs[idx].status = JobStatus.pending;
+      _jobs[idx].scheduledDate = null;
+      await _save();
+      notifyListeners();
+    }
+  }
+
+  List<UploadJob> get todayYoutubeJobs =>
+      _jobs.where((j) =>
+        j.status == JobStatus.completed &&
+        j.completedAt != null &&
+        j.completedAt!.toIso8601String().substring(0, 10) == DateTime.now().toIso8601String().substring(0, 10) &&
+        j.uploadedToYoutube
+      ).toList()
+        ..sort((a, b) => (b.completedAt ?? DateTime(0)).compareTo(a.completedAt ?? DateTime(0)));
+
+  List<UploadJob> get todayTelegramJobs =>
+      _jobs.where((j) =>
+        j.status == JobStatus.completed &&
+        j.completedAt != null &&
+        j.completedAt!.toIso8601String().substring(0, 10) == DateTime.now().toIso8601String().substring(0, 10) &&
+        j.uploadedToTelegram
+      ).toList()
+        ..sort((a, b) => (b.completedAt ?? DateTime(0)).compareTo(a.completedAt ?? DateTime(0)));
 }

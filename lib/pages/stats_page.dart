@@ -17,9 +17,12 @@ class StatsPage extends StatefulWidget {
   State<StatsPage> createState() => _StatsPageState();
 }
 
-class _StatsPageState extends State<StatsPage> {
+class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
   _ChartRange _chartRange = _ChartRange.week;
   int _recentPage = 0;
+  int _historyFilter = 0;
   static const int _pageSize = 10;
 
   void _showChannelPicker(BuildContext context) {
@@ -71,6 +74,25 @@ class _StatsPageState extends State<StatsPage> {
     );
   }
 
+  Widget _buildFilterChip2(int index, String label) {
+    final selected = _historyFilter == index;
+    return GestureDetector(
+      onTap: () => setState(() {
+        _historyFilter = index;
+        _recentPage = 0;
+      }),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        decoration: BoxDecoration(
+          color: selected ? Colors.green : Colors.grey[800],
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Text(label,
+            style: TextStyle(color: selected ? Colors.white : Colors.grey[400], fontSize: 11, fontWeight: FontWeight.w600)),
+      ),
+    );
+  }
+
   String _channelName(String channelId) {
     final c = widget.accountManager.channels.where((ch) => ch.id == channelId).firstOrNull;
     return c?.title ?? channelId;
@@ -78,6 +100,7 @@ class _StatsPageState extends State<StatsPage> {
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
     final acct = widget.accountManager.currentAccount;
     final ch = widget.accountManager.selectedChannel;
     final completed = widget.scheduler.completedJobs;
@@ -142,14 +165,16 @@ class _StatsPageState extends State<StatsPage> {
       if (v > maxVal) maxVal = v;
     }
 
-    final todayCount = ch != null
-        ? widget.scheduler.todayUploadedCountForChannel(ch.id)
-        : widget.scheduler.todayUploadedCount;
+    final ytToday = ch != null
+        ? widget.scheduler.todayYoutubeUploadedCountForChannel(ch.id)
+        : widget.scheduler.todayYoutubeCount;
+    final tgToday = widget.scheduler.todayTelegramCount;
 
     return Scaffold(
       backgroundColor: Colors.black,
+      appBar: AppBar(title: const Text('Home')),
       body: ListView(
-        padding: const EdgeInsets.fromLTRB(20, 60, 20, 20),
+        padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
         children: [
           // Profile card
           Container(
@@ -214,65 +239,84 @@ class _StatsPageState extends State<StatsPage> {
             const SizedBox(height: 16),
           ],
 
-          // Today + Total row
-          Row(
-            children: [
-              Expanded(
-                child: Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.grey[900],
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
+          // Today's Uploads - YouTube
+          Container(
+            padding: const EdgeInsets.all(16),
+            margin: const EdgeInsets.only(bottom: 12),
+            decoration: BoxDecoration(
+              color: Colors.grey[900],
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.videocam, color: Colors.red, size: 20),
+                    const SizedBox(width: 8),
+                    Text("Today's Uploads", style: TextStyle(color: Colors.grey[400], fontSize: 12)),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    Text('$ytToday', style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold)),
+                    const Spacer(),
+                    SizedBox(
+                      width: 40, height: 40,
+                      child: Stack(
+                        fit: StackFit.expand,
                         children: [
-                          Icon(Icons.today, color: Colors.green, size: 20),
-                          const SizedBox(width: 8),
-                          Text("Today's Uploads", style: TextStyle(color: Colors.grey[400], fontSize: 12)),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          Text(
-                            '$todayCount',
-                            style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold),
+                          CircularProgressIndicator(
+                            value: ytToday / UploadScheduler.youtubeDailyLimit,
+                            backgroundColor: Colors.grey[800],
+                            color: ytToday >= UploadScheduler.youtubeDailyLimit ? Colors.red : Colors.red,
+                            strokeWidth: 4,
                           ),
-                          const Spacer(),
-                          SizedBox(
-                            width: 40, height: 40,
-                            child: Stack(
-                              fit: StackFit.expand,
-                              children: [
-                                CircularProgressIndicator(
-                                  value: todayCount / UploadScheduler.dailyLimit,
-                                  backgroundColor: Colors.grey[800],
-                                  color: todayCount >= UploadScheduler.dailyLimit
-                                      ? Colors.red : Colors.green,
-                                  strokeWidth: 4,
-                                ),
-                                Center(
-                                  child: Text(
-                                    '${(todayCount / UploadScheduler.dailyLimit * 100).toInt()}%',
-                                    style: TextStyle(color: Colors.grey[300], fontSize: 9, fontWeight: FontWeight.bold),
-                                  ),
-                                ),
-                              ],
+                          Center(
+                            child: Text(
+                              '${(ytToday / UploadScheduler.youtubeDailyLimit * 100).toInt()}%',
+                              style: TextStyle(color: Colors.grey[300], fontSize: 9, fontWeight: FontWeight.bold),
                             ),
                           ),
                         ],
                       ),
-                      const SizedBox(height: 4),
-                      Text('/ ${UploadScheduler.dailyLimit} daily limit${ch != null ? ' (${ch.title})' : ''}',
-                          style: TextStyle(color: Colors.grey[600], fontSize: 11)),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-              ),
-              const SizedBox(width: 12),
+                Text('/ ${UploadScheduler.youtubeDailyLimit} YouTube daily limit${ch != null ? ' (${ch.title})' : ''}',
+                    style: TextStyle(color: Colors.grey[600], fontSize: 11)),
+              ],
+            ),
+          ),
+
+          // Today's Uploads - Telegram
+          Container(
+            padding: const EdgeInsets.all(16),
+            margin: const EdgeInsets.only(bottom: 12),
+            decoration: BoxDecoration(
+              color: Colors.grey[900],
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.telegram, color: Colors.blue, size: 20),
+                    const SizedBox(width: 8),
+                    Text("Telegram Today", style: TextStyle(color: Colors.grey[400], fontSize: 12)),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text('$tgToday', style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold)),
+              ],
+            ),
+          ),
+
+          // Total + Queue row
+          Row(
+            children: [
               Expanded(
                 child: Container(
                   padding: const EdgeInsets.all(16),
@@ -291,23 +335,14 @@ class _StatsPageState extends State<StatsPage> {
                         ],
                       ),
                       const SizedBox(height: 8),
-                      Text(
-                        '${completed.length}',
-                        style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold),
-                      ),
+                      Text('${completed.length}', style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold)),
                       const SizedBox(height: 4),
                       Text('uploads', style: TextStyle(color: Colors.grey[600], fontSize: 11)),
                     ],
                   ),
                 ),
               ),
-            ],
-          ),
-          const SizedBox(height: 12),
-
-          // Queue + Failed row
-          Row(
-            children: [
+              const SizedBox(width: 12),
               Expanded(
                 child: Container(
                   padding: const EdgeInsets.all(16),
@@ -334,39 +369,29 @@ class _StatsPageState extends State<StatsPage> {
                   ),
                 ),
               ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.grey[900],
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Icon(Icons.error_outline, color: failed.isEmpty ? Colors.grey : Colors.red, size: 20),
-                          const SizedBox(width: 8),
-                          Text('Failed', style: TextStyle(color: Colors.grey[400], fontSize: 12)),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        '${failed.length}',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 28,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
             ],
           ),
+          const SizedBox(height: 12),
+
+          // Failed
+          if (failed.isNotEmpty)
+            Container(
+              padding: const EdgeInsets.all(16),
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                color: Colors.grey[900],
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.error_outline, color: Colors.red, size: 20),
+                  const SizedBox(width: 8),
+                  Text('Failed', style: TextStyle(color: Colors.grey[400], fontSize: 12)),
+                  const Spacer(),
+                  Text('${failed.length}', style: const TextStyle(color: Colors.red, fontSize: 22, fontWeight: FontWeight.bold)),
+                ],
+              ),
+            ),
           const SizedBox(height: 24),
 
           // Chart
@@ -486,14 +511,29 @@ class _StatsPageState extends State<StatsPage> {
             const SizedBox(height: 24),
           ],
 
-          // Upload history log (paginated, all statuses)
-          Text('Recent Uploads', style: TextStyle(color: Colors.grey[400], fontSize: 13, fontWeight: FontWeight.w600)),
+          // Upload history tabs
+          Row(
+            children: [
+              Text('Recent Uploads', style: TextStyle(color: Colors.grey[400], fontSize: 13, fontWeight: FontWeight.w600)),
+              const Spacer(),
+              _buildFilterChip2(0, 'All'),
+              const SizedBox(width: 4),
+              _buildFilterChip2(1, 'YT'),
+              const SizedBox(width: 4),
+              _buildFilterChip2(2, 'TG'),
+            ],
+          ),
           const SizedBox(height: 8),
           () {
             final all = widget.scheduler.recentJobs;
-            final totalPages = all.isEmpty ? 1 : (all.length / _pageSize).ceil();
+            final filtered = _historyFilter == 0
+                ? all
+                : _historyFilter == 1
+                    ? all.where((j) => j.uploadedToYoutube).toList()
+                    : all.where((j) => j.uploadedToTelegram).toList();
+            final totalPages = filtered.isEmpty ? 1 : (filtered.length / _pageSize).ceil();
             final page = _recentPage.clamp(0, totalPages - 1);
-            final items = all.skip(page * _pageSize).take(_pageSize).toList();
+            final items = filtered.skip(page * _pageSize).take(_pageSize).toList();
 
             if (items.isEmpty) {
               return Text('No uploads yet', style: TextStyle(color: Colors.grey[600], fontSize: 13));
@@ -523,35 +563,50 @@ class _StatsPageState extends State<StatsPage> {
                     iconColor = Colors.orange;
                     dateText = '';
                   }
-                  return Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.grey[900],
-                      border: Border(bottom: BorderSide(color: Colors.grey[800]!)),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(icon, color: iconColor, size: 16),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                job.channelId.isNotEmpty ? _channelName(job.channelId) : job.displayName,
-                                style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                              Text(job.displayName,
-                                  style: TextStyle(color: Colors.grey[500], fontSize: 10),
-                                  overflow: TextOverflow.ellipsis),
-                            ],
+                    return Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: Colors.grey[900],
+                        border: Border(bottom: BorderSide(color: Colors.grey[800]!)),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(icon, color: iconColor, size: 16),
+                          const SizedBox(width: 6),
+                          if (job.uploadedToYoutube)
+                            Container(
+                              margin: const EdgeInsets.only(right: 3),
+                              padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+                              decoration: BoxDecoration(color: Colors.red, borderRadius: BorderRadius.circular(3)),
+                              child: const Text('YT', style: TextStyle(color: Colors.white, fontSize: 7, fontWeight: FontWeight.bold)),
+                            ),
+                          if (job.uploadedToTelegram)
+                            Container(
+                              margin: const EdgeInsets.only(right: 3),
+                              padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+                              decoration: BoxDecoration(color: Colors.blue, borderRadius: BorderRadius.circular(3)),
+                              child: const Text('TG', style: TextStyle(color: Colors.white, fontSize: 7, fontWeight: FontWeight.bold)),
+                            ),
+                          const SizedBox(width: 4),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  job.channelId.isNotEmpty ? _channelName(job.channelId) : job.displayName,
+                                  style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                Text(job.displayName,
+                                    style: TextStyle(color: Colors.grey[500], fontSize: 10),
+                                    overflow: TextOverflow.ellipsis),
+                              ],
+                            ),
                           ),
-                        ),
-                        Text(dateText, style: TextStyle(color: Colors.grey[500], fontSize: 11)),
-                      ],
-                    ),
-                  );
+                          Text(dateText, style: TextStyle(color: Colors.grey[500], fontSize: 11)),
+                        ],
+                      ),
+                    );
                 }),
                 if (totalPages > 1) ...[
                   const SizedBox(height: 12),

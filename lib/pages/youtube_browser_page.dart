@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/account_manager.dart';
+import '../youtube_uploader.dart';
 import 'video_player_page.dart';
 
 class YoutubeVideoInfo {
@@ -37,7 +38,9 @@ class YoutubeBrowserPage extends StatefulWidget {
   State<YoutubeBrowserPage> createState() => _YoutubeBrowserPageState();
 }
 
-class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> {
+class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
   List<YoutubeVideoInfo> _videos = [];
   bool _loading = false;
   String? _nextPageToken;
@@ -111,13 +114,14 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> {
 
       final newVideos = items.map<YoutubeVideoInfo>((item) {
         final snippet = item['snippet'] as Map? ?? {};
-        final thumbnails = snippet['thumbnails'] as Map? ?? {};
-        final thumb = (thumbnails['high'] ?? thumbnails['medium'] ?? thumbnails['default']) as Map?;
         final title = (snippet['title'] as String?) ?? '';
+        final videoId = snippet['resourceId']?['videoId'] as String? ?? '';
         return YoutubeVideoInfo(
-          id: snippet['resourceId']?['videoId'] as String? ?? '',
+          id: videoId,
           title: title,
-          thumbnailUrl: thumb?['url'] as String?,
+          thumbnailUrl: videoId.isNotEmpty
+              ? 'https://img.youtube.com/vi/$videoId/maxresdefault.jpg'
+              : null,
           publishedAt: snippet['publishedAt'] != null
               ? DateTime.tryParse(snippet['publishedAt'] as String)
               : null,
@@ -159,21 +163,57 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> {
       );
       return;
     }
+
+    final quality = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.grey[900],
+        title: const Text('Download Quality', style: TextStyle(color: Colors.white)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _qualityOption(ctx, 'Best available', null, Icons.hd),
+            _qualityOption(ctx, '1080p (Full HD)', '1080', Icons.high_quality),
+            _qualityOption(ctx, '720p (HD)', '720', Icons.high_quality),
+            _qualityOption(ctx, '480p (SD)', '480', Icons.sd),
+            _qualityOption(ctx, 'Audio only (MP3)', 'audio', Icons.audiotrack),
+          ],
+        ),
+      ),
+    );
+    if (quality == null) return;
+
     for (final id in _selectedIds) {
       final url = 'https://www.youtube.com/watch?v=$id';
       final uri = Uri.parse(url);
       if (await canLaunchUrl(uri)) {
-        await launchUrl(uri);
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Opening YouTube…')),
+        );
       } else {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Cannot open YouTube. Try installing the YouTube app or Safari.')),
         );
       }
     }
+    setState(() => _selectedIds.clear());
+  }
+
+  Widget _qualityOption(BuildContext ctx, String label, String? value, IconData icon) {
+    return ListTile(
+      leading: Icon(icon, color: Colors.white70),
+      title: Text(label, style: const TextStyle(color: Colors.white, fontSize: 14)),
+      onTap: () => Navigator.pop(ctx, value),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      tileColor: Colors.grey[850],
+      contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    super.build(context);
     final filtered = _searchCtrl.text.isEmpty
         ? _videos
         : _videos.where((v) =>
@@ -299,8 +339,16 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> {
                                   Expanded(
                                     child: ClipRRect(
                                       borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
-                                      child: v.thumbnailUrl != null
-                                          ? Image.network(v.thumbnailUrl!, fit: BoxFit.cover)
+                                      child: v.id.isNotEmpty
+                                          ? Image.network(
+                                              'https://img.youtube.com/vi/${v.id}/maxresdefault.jpg',
+                                              fit: BoxFit.cover,
+                                              errorBuilder: (_, __, ___) => Image.network(
+                                                'https://img.youtube.com/vi/${v.id}/hqdefault.jpg',
+                                                fit: BoxFit.cover,
+                                                errorBuilder: (_, __, ___) => Container(color: Colors.grey[800]),
+                                              ),
+                                            )
                                           : Container(color: Colors.grey[800]),
                                     ),
                                   ),

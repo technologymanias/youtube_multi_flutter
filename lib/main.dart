@@ -8,9 +8,11 @@ import 'SplashScreen.dart';
 import 'services/account_manager.dart';
 import 'services/upload_scheduler.dart';
 import 'services/background_service.dart';
+import 'services/telegram_service.dart';
 import 'pages/upload_queue_page.dart';
 import 'pages/youtube_browser_page.dart';
 import 'pages/stats_page.dart';
+import 'pages/telegram_page.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -53,6 +55,10 @@ final GoogleSignIn googleSignIn = GoogleSignIn(
   ],
 );
 
+// Get your own api_id and api_hash from https://my.telegram.org/apps
+const int telegramApiId = 1959019;
+const String telegramApiHash = 'b23130118cee6b065cf86ed78c171775';
+
 class MainShell extends StatefulWidget {
   @override
   State<MainShell> createState() => _MainShellState();
@@ -61,6 +67,7 @@ class MainShell extends StatefulWidget {
 class _MainShellState extends State<MainShell> {
   late final AccountManager _accountManager;
   late final UploadScheduler _scheduler;
+  late final TelegramService _telegramService;
   bool _initialized = false;
   final PageController _pageCtrl = PageController();
 
@@ -69,12 +76,18 @@ class _MainShellState extends State<MainShell> {
     super.initState();
     _accountManager = AccountManager(googleSignIn: googleSignIn);
     _scheduler = UploadScheduler();
+    _telegramService = TelegramService(apiId: telegramApiId, apiHash: telegramApiHash);
     _init();
   }
 
   Future<void> _init() async {
-    await _scheduler.init();
-    await _accountManager.init();
+    try {
+      await _scheduler.init();
+      await _accountManager.init();
+    } catch (_) {
+      // Scheduler / account init errors — app may still work
+    }
+    // Telegram session restore is handled by TelegramPage's _checkAuth()
     _accountManager.addListener(_onAccountChanged);
     _scheduler.addListener(_onSchedulerChanged);
     if (mounted) setState(() => _initialized = true);
@@ -93,6 +106,7 @@ class _MainShellState extends State<MainShell> {
     _accountManager.removeListener(_onAccountChanged);
     _scheduler.removeListener(_onSchedulerChanged);
     _scheduler.dispose();
+    _telegramService.dispose();
     _pageCtrl.dispose();
     super.dispose();
   }
@@ -142,7 +156,7 @@ class _MainShellState extends State<MainShell> {
                     ),
                     const SizedBox(height: 12),
                     Text(
-                      'Upload queue • Scheduling • Multi-channel • 15/day limit',
+                      'Upload queue • Scheduling • Multi-channel • 15/day YouTube limit',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: Colors.grey[400], fontSize: 13),
                     ),
@@ -159,7 +173,7 @@ class _MainShellState extends State<MainShell> {
                           _step('1', 'Tap Sign in with Google below'),
                           _step('2', 'Choose your YouTube channel'),
                           _step('3', 'Select videos from your gallery'),
-                          _step('4', 'They auto-upload with 15/day scheduling'),
+                          _step('4', 'They auto-upload with 15/day YouTube scheduling'),
                           _step('5', 'Free up iPhone space safely'),
                         ],
                       ),
@@ -204,17 +218,21 @@ class _MainShellState extends State<MainShell> {
     );
   }
 
+  int get _pageCount => 4;
+
   Widget _buildMainApp() {
-    final pages = <Widget>[
+    final realPages = <Widget>[
       UploadQueuePage(
         scheduler: _scheduler,
         accountManager: _accountManager,
         accessToken: _accountManager.accessToken,
+        telegramService: _telegramService,
       ),
       YoutubeBrowserPage(
         accountManager: _accountManager,
         localVideoTitles: _buildLocalTitles(),
       ),
+      TelegramPage(service: _telegramService, localTitles: _buildLocalTitles()),
       StatsPage(
         scheduler: _scheduler,
         accountManager: _accountManager,
@@ -229,11 +247,38 @@ class _MainShellState extends State<MainShell> {
       ),
     ];
 
+    // Wrap with sentinel pages for infinite scroll
+    Widget sentinelOf(Widget w) {
+      if (w is UploadQueuePage) {
+        return UploadQueuePage(
+          scheduler: w.scheduler,
+          accountManager: w.accountManager,
+          accessToken: w.accessToken,
+          telegramService: w.telegramService,
+          isSentinel: true,
+        );
+      }
+      return w;
+    }
+
+    final pages = <Widget>[
+      sentinelOf(realPages.last),
+      ...realPages,
+      sentinelOf(realPages.first),
+    ];
+
     return Scaffold(
       drawer: _buildDrawer(),
       body: PageView(
         controller: _pageCtrl,
         children: pages,
+        onPageChanged: (i) {
+          if (i == 0) {
+            _pageCtrl.jumpToPage(_pageCount);
+          } else if (i == _pageCount + 1) {
+            _pageCtrl.jumpToPage(1);
+          }
+        },
       ),
     );
   }
@@ -257,6 +302,14 @@ class _MainShellState extends State<MainShell> {
             ),
           ),
 
+          // Page navigation
+          _drawerItem(Icons.cloud_upload, 'Status Page', 0),
+          _drawerItem(Icons.videocam, 'Youtube', 1),
+          _drawerItem(Icons.telegram, 'Telegram', 2),
+          _drawerItem(Icons.bar_chart, 'Home', 3),
+
+          const Divider(color: Colors.grey, height: 1),
+
           // Today's count
           ListTile(
             leading: const Icon(Icons.today),
@@ -265,7 +318,7 @@ class _MainShellState extends State<MainShell> {
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
               decoration: BoxDecoration(color: Colors.green, borderRadius: BorderRadius.circular(12)),
               child: Text(
-                '${_scheduler.todayUploadedCount}',
+                '${_scheduler.todayYoutubeUploadedCount}',
                 style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
               ),
             ),
@@ -283,6 +336,21 @@ class _MainShellState extends State<MainShell> {
                 style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
               ),
             ),
+          ),
+
+          // Default destination
+          FutureBuilder<UploadDestination>(
+            future: TelegramService.getDefaultDestination(),
+            builder: (_, snap) {
+              final dest = snap.data ?? UploadDestination.youtube;
+              final labels = {UploadDestination.youtube: 'YouTube', UploadDestination.telegram: 'Telegram', UploadDestination.both: 'YouTube + Telegram'};
+              return ListTile(
+                leading: const Icon(Icons.settings_input_component),
+                title: const Text('Default Destination'),
+                subtitle: Text(labels[dest]!, style: TextStyle(color: Colors.grey[400], fontSize: 12)),
+                onTap: () => _showDestinationPicker(),
+              );
+            },
           ),
 
           // Channel selector
@@ -329,6 +397,53 @@ class _MainShellState extends State<MainShell> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _drawerItem(IconData icon, String title, int pageIndex) {
+    return ListTile(
+      leading: Icon(icon),
+      title: Text(title),
+      onTap: () {
+        _pageCtrl.jumpToPage(pageIndex + 1);
+        Navigator.pop(context);
+      },
+    );
+  }
+
+  Future<void> _showDestinationPicker() async {
+    final current = await TelegramService.getDefaultDestination();
+    final dest = await showDialog<UploadDestination>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.grey[900],
+        title: const Text('Default Upload Destination', style: TextStyle(color: Colors.white)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _destRadio(ctx, UploadDestination.youtube, 'YouTube', current),
+            _destRadio(ctx, UploadDestination.telegram, 'Telegram Saved Messages', current),
+            _destRadio(ctx, UploadDestination.both, 'YouTube + Telegram', current),
+          ],
+        ),
+      ),
+    );
+    if (dest != null && dest != current) {
+      await TelegramService.setDefaultDestination(dest);
+      setState(() {});
+    }
+  }
+
+  Widget _destRadio(BuildContext ctx, UploadDestination dest, String label, UploadDestination current) {
+    return RadioListTile<UploadDestination>(
+      dense: true,
+      title: Text(label, style: const TextStyle(color: Colors.white, fontSize: 14)),
+      value: dest,
+      groupValue: current,
+      activeColor: Colors.green,
+      onChanged: (v) {
+        if (v != null) Navigator.pop(ctx, v);
+      },
     );
   }
 }

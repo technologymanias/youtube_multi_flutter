@@ -211,4 +211,88 @@ class YouTubeUploader {
 
     throw Exception('Upload failed after maximum retries');
   }
+
+  Future<List<Map<String, String>>> listPlaylists() async {
+    final res = await http.get(
+      Uri.parse('https://www.googleapis.com/youtube/v3/playlists?part=snippet&mine=true&maxResults=50'),
+      headers: {'Authorization': 'Bearer $accessToken'},
+    );
+    if (res.statusCode != 200) return [];
+    final data = jsonDecode(res.body);
+    return ((data['items'] as List?) ?? []).map<Map<String, String>>((p) => {
+      'id': p['id'] as String? ?? '',
+      'title': p['snippet']?['title'] as String? ?? '',
+    }).toList();
+  }
+
+  Future<void> addToPlaylistById(String videoId, String playlistId) async {
+    await http.post(
+      Uri.parse('https://www.googleapis.com/youtube/v3/playlistItems?part=snippet'),
+      headers: {
+        'Authorization': 'Bearer $accessToken',
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({
+        'snippet': {
+          'playlistId': playlistId,
+          'resourceId': {'kind': 'youtube#video', 'videoId': videoId},
+        },
+      }),
+    );
+  }
+
+  Future<void> addVideoToPlaylist(String videoId, String playlistName) async {
+    final findRes = await http.get(
+      Uri.parse('https://www.googleapis.com/youtube/v3/playlists?part=snippet&mine=true'),
+      headers: {'Authorization': 'Bearer $accessToken'},
+    );
+    if (findRes.statusCode != 200) return;
+
+    final data = jsonDecode(findRes.body);
+    final existing = (data['items'] as List?)?.firstWhere(
+      (p) => (p['snippet']?['title'] as String?) == playlistName,
+      orElse: () => null,
+    );
+
+    String? playlistId;
+    if (existing != null) {
+      playlistId = existing['id'] as String?;
+    } else {
+      final createRes = await http.post(
+        Uri.parse('https://www.googleapis.com/youtube/v3/playlists?part=snippet'),
+        headers: {
+          'Authorization': 'Bearer $accessToken',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({
+          'snippet': {
+            'title': playlistName,
+            'description': 'Auto-created folder: $playlistName',
+          },
+        }),
+      );
+      if (createRes.statusCode == 200) {
+        playlistId = jsonDecode(createRes.body)['id'] as String?;
+      }
+    }
+
+    if (playlistId != null) {
+      await http.post(
+        Uri.parse('https://www.googleapis.com/youtube/v3/playlistItems?part=snippet'),
+        headers: {
+          'Authorization': 'Bearer $accessToken',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({
+          'snippet': {
+            'playlistId': playlistId,
+            'resourceId': {
+              'kind': 'youtube#video',
+              'videoId': videoId,
+            },
+          },
+        }),
+      );
+    }
+  }
 }
