@@ -110,6 +110,48 @@ class UploadScheduler extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Job ids whose Telegram copy was confirmed deleted inside Telegram.
+  ///
+  /// Persisted alongside the jobs: a restart must not hand every upload its
+  /// badge back just because the answer lived only in memory.
+  final Set<String> _deletedTelegramJobIds = {};
+
+  /// Whether the job's Telegram copy is still believed to exist. The TG badge
+  /// is only shown while this is true.
+  bool isOnTelegram(UploadJob job) =>
+      job.uploadedToTelegram && !_deletedTelegramJobIds.contains(job.id);
+
+  /// Applies one round of verification against Telegram. [present] re-enables
+  /// the badge, [absent] clears it, and anything in neither list keeps
+  /// whatever it already had — an unverifiable probe must never silently
+  /// restore a badge the user already saw disappear.
+  void applyTelegramVerdict(
+      {required Set<String> present, required Set<String> absent}) {
+    var changed = false;
+    for (final id in present) {
+      if (_deletedTelegramJobIds.remove(id)) changed = true;
+    }
+    for (final id in absent) {
+      if (_deletedTelegramJobIds.add(id)) changed = true;
+    }
+    if (!changed) return;
+    _persistDeletedTelegram();
+    notifyListeners();
+  }
+
+  void clearDeletedOnTelegram(String jobId) {
+    if (_deletedTelegramJobIds.remove(jobId)) {
+      _persistDeletedTelegram();
+      notifyListeners();
+    }
+  }
+
+  /// The deleted-set rides in the same secure-storage blob as the jobs, so it
+  /// is written through [_save] rather than a key of its own.
+  void _persistDeletedTelegram() {
+    unawaited(_save());
+  }
+
   List<UploadJob> get jobs => List.unmodifiable(_jobs);
   int get totalCount => _jobs.length;
   int get pendingCount => _jobs.where((j) => j.status == JobStatus.pending).length;
@@ -169,14 +211,35 @@ class UploadScheduler extends ChangeNotifier {
   Future<void> load() async {
     final data = await _storage.read(key: _storageKey);
     if (data == null) return;
-    final list = jsonDecode(data) as List;
-    _jobs = list.map((e) => UploadJob.fromJson(e as Map<String, dynamic>)).toList();
+    final decoded = jsonDecode(data);
+    if (decoded is List) {
+      // Legacy shape: the raw job list, before the TG verdict was stored.
+      _jobs = decoded
+          .map((e) => UploadJob.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } else if (decoded is Map<String, dynamic>) {
+      _jobs = [
+        for (final e in (decoded['jobs'] as List?) ?? const [])
+          UploadJob.fromJson(e as Map<String, dynamic>),
+      ];
+      _deletedTelegramJobIds
+        ..clear()
+        ..addAll(
+            ((decoded['deletedTelegram'] as List?) ?? const [])
+                .map((e) => '$e'));
+    }
+    // Ids for jobs that no longer exist would otherwise linger forever.
+    final known = {for (final j in _jobs) j.id};
+    _deletedTelegramJobIds.removeWhere((id) => !known.contains(id));
     _rescheduleAfterRestart();
     notifyListeners();
   }
 
   Future<void> _save() async {
-    final data = jsonEncode(_jobs.map((j) => j.toJson()).toList());
+    final data = jsonEncode(<String, dynamic>{
+      'jobs': _jobs.map((j) => j.toJson()).toList(),
+      'deletedTelegram': _deletedTelegramJobIds.toList(),
+    });
     await _storage.write(key: _storageKey, value: data);
     unawaited(updateBadgeCount(pendingCount + uploadingCount));
   }

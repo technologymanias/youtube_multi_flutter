@@ -9,10 +9,12 @@ import 'services/account_manager.dart';
 import 'services/upload_scheduler.dart';
 import 'services/background_service.dart';
 import 'services/telegram_service.dart';
+import 'services/folder_store.dart';
 import 'pages/upload_queue_page.dart';
 import 'pages/youtube_browser_page.dart';
 import 'pages/stats_page.dart';
 import 'pages/telegram_page.dart';
+import 'pages/folder_strip.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -68,6 +70,7 @@ class _MainShellState extends State<MainShell> {
   late final AccountManager _accountManager;
   late final UploadScheduler _scheduler;
   late final TelegramService _telegramService;
+  late final FolderStore _folderStore;
   bool _initialized = false;
   final PageController _pageCtrl = PageController();
 
@@ -77,6 +80,7 @@ class _MainShellState extends State<MainShell> {
     _accountManager = AccountManager(googleSignIn: googleSignIn);
     _scheduler = UploadScheduler();
     _telegramService = TelegramService(apiId: telegramApiId, apiHash: telegramApiHash);
+    _folderStore = FolderStore();
     _init();
   }
 
@@ -87,9 +91,14 @@ class _MainShellState extends State<MainShell> {
     } catch (_) {
       // Scheduler / account init errors — app may still work
     }
+    // Folders are pure local state, so a failed read must never block startup.
+    try {
+      await _folderStore.load();
+    } catch (_) {}
     // Telegram session restore is handled by TelegramPage's _checkAuth()
     _accountManager.addListener(_onAccountChanged);
     _scheduler.addListener(_onSchedulerChanged);
+    _folderStore.addListener(_onFoldersChanged);
     if (mounted) setState(() => _initialized = true);
   }
 
@@ -101,12 +110,18 @@ class _MainShellState extends State<MainShell> {
     if (mounted) setState(() {});
   }
 
+  void _onFoldersChanged() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
     _accountManager.removeListener(_onAccountChanged);
     _scheduler.removeListener(_onSchedulerChanged);
+    _folderStore.removeListener(_onFoldersChanged);
     _scheduler.dispose();
     _telegramService.dispose();
+    _folderStore.dispose();
     _pageCtrl.dispose();
     super.dispose();
   }
@@ -117,6 +132,22 @@ class _MainShellState extends State<MainShell> {
       titles.add(job.title.trim());
     }
     return titles;
+  }
+
+  /// Resolves a YouTube video to a device gallery asset so the browser page
+  /// can show a local frame when YouTube has no public thumbnail (private).
+  String? _resolveLocalAssetId(String videoId, String title) {
+    if (videoId.isNotEmpty) {
+      for (final job in _scheduler.jobs) {
+        if (job.youtubeVideoId == videoId) return job.assetId;
+      }
+    }
+    final trimmed = title.trim();
+    if (trimmed.isEmpty) return null;
+    for (final job in _scheduler.jobs) {
+      if (job.title.trim() == trimmed) return job.assetId;
+    }
+    return null;
   }
 
   @override
@@ -227,12 +258,19 @@ class _MainShellState extends State<MainShell> {
         accountManager: _accountManager,
         accessToken: _accountManager.accessToken,
         telegramService: _telegramService,
+        folderStore: _folderStore,
       ),
       YoutubeBrowserPage(
         accountManager: _accountManager,
         localVideoTitles: _buildLocalTitles(),
+        resolveLocalAssetId: _resolveLocalAssetId,
+        folderStore: _folderStore,
       ),
-      TelegramPage(service: _telegramService, localTitles: _buildLocalTitles()),
+      TelegramPage(
+        service: _telegramService,
+        localTitles: _buildLocalTitles(),
+        folderStore: _folderStore,
+      ),
       StatsPage(
         scheduler: _scheduler,
         accountManager: _accountManager,
@@ -255,6 +293,7 @@ class _MainShellState extends State<MainShell> {
           accountManager: w.accountManager,
           accessToken: w.accessToken,
           telegramService: w.telegramService,
+          folderStore: w.folderStore,
           isSentinel: true,
         );
       }
@@ -351,6 +390,16 @@ class _MainShellState extends State<MainShell> {
                 onTap: () => _showDestinationPicker(),
               );
             },
+          ),
+
+          ListTile(
+            leading: const Icon(Icons.folder_copy),
+            title: const Text('Folder backup'),
+            subtitle: Text(
+              '${_folderStore.folders.length} folder${_folderStore.folders.length == 1 ? '' : 's'} on this device',
+              style: TextStyle(color: Colors.grey[400], fontSize: 12),
+            ),
+            onTap: () => showFolderBackupDialog(context, _folderStore),
           ),
 
           // Channel selector

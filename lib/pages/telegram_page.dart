@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import '../services/telegram_service.dart';
+import '../services/folder_store.dart';
+import 'folder_strip.dart';
 import 'telegram_auth_page.dart';
 import 'telegram_photo_viewer.dart';
 import 'telegram_reel_player.dart';
@@ -11,8 +13,14 @@ import 'telegram_reel_player.dart';
 class TelegramPage extends StatefulWidget {
   final TelegramService service;
   final Set<String> localTitles;
+  final FolderStore? folderStore;
 
-  const TelegramPage({Key? key, required this.service, this.localTitles = const {}}) : super(key: key);
+  const TelegramPage({
+    Key? key,
+    required this.service,
+    this.localTitles = const {},
+    this.folderStore,
+  }) : super(key: key);
 
   @override
   State<TelegramPage> createState() => _TelegramPageState();
@@ -29,10 +37,30 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
   final Set<int> _selectedIds = {};
   int _tabIndex = 0;
 
+  /// Folder the grid is filtered to, or `null` for everything.
+  String? _selectedFolderId;
+
   @override
   void initState() {
     super.initState();
+    widget.folderStore?.addListener(_onFoldersChanged);
     _checkAuth();
+  }
+
+  void _onFoldersChanged() {
+    if (!mounted) return;
+    // A deleted folder must not leave the grid filtered to something gone.
+    if (_selectedFolderId != null &&
+        widget.folderStore?.byId(_selectedFolderId) == null) {
+      _selectedFolderId = null;
+    }
+    setState(() {});
+  }
+
+  @override
+  void dispose() {
+    widget.folderStore?.removeListener(_onFoldersChanged);
+    super.dispose();
   }
 
   Future<void> _checkAuth() async {
@@ -60,7 +88,16 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
     setState(() { _loading = true; _error = null; _reauthRequired = false; });
     try {
       final msgs = await widget.service.getSavedMessages(limit: 50);
-      setState(() { _messages = msgs; _loading = false; });
+      if (!mounted) return;
+      setState(() {
+        _messages = msgs;
+        _loading = false;
+        // A sync can drop messages the user deleted in Telegram; rebuild the
+        // memo from what is actually in the new list.
+        _thumbFutures.clear();
+        _thumbAttempts.clear();
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) => _prefetchThumbnails());
     } catch (e) {
       if (!mounted) return;
       if (_isAuthError(e)) {
@@ -77,6 +114,50 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
           _loading = false;
         });
       }
+    }
+  }
+
+  /// One future per tile. A `FutureBuilder` builds a fresh future on every
+  /// rebuild, so without this every tap and tab switch restarted every
+  /// thumbnail request in view.
+  final Map<int, Future<Uint8List?>> _thumbFutures = {};
+
+  /// How many times a tile has already been retried after an empty result.
+  final Map<int, int> _thumbAttempts = {};
+
+  Future<Uint8List?> _thumbFor(SavedMessageItem msg) {
+    final key = msg.thumbnailId;
+    if (key == null) return Future<Uint8List?>.value(null);
+    final existing = _thumbFutures[key];
+    if (existing != null) return existing;
+
+    final future = widget.service.getThumbnail(msg);
+    _thumbFutures[key] = future;
+    future.then((bytes) {
+      if (bytes != null) return;
+      // Empty result: drop it so a later rebuild can ask again instead of
+      // pinning the icon for the rest of the session. One nudge only — the
+      // service de-dupes, so a tile that keeps failing settles on the icon.
+      if (!identical(_thumbFutures[key], future)) return;
+      _thumbFutures.remove(key);
+      final tries = (_thumbAttempts[key] ?? 0) + 1;
+      _thumbAttempts[key] = tries;
+      if (tries > 1 || !mounted) return;
+      Future.delayed(const Duration(seconds: 6), () {
+        if (mounted) setState(() {});
+      });
+    });
+    return future;
+  }
+
+  /// Warm the whole list while the grid scrolls, so swiping to another tab or
+  /// further down the page finds the bytes already in the cache.
+  void _prefetchThumbnails() {
+    if (!mounted) return;
+    for (final msg in _messages) {
+      if (msg.thumbnailId == null) continue;
+      if (_thumbFutures.containsKey(msg.thumbnailId)) continue;
+      _thumbFutures[msg.thumbnailId!] = widget.service.getThumbnail(msg);
     }
   }
 
@@ -130,16 +211,29 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
   List<SavedMessageItem> get _fileMessages =>
       _messages.where((m) => m.mediaType == SavedMediaType.document || m.mediaType == SavedMediaType.audio).toList();
 
+  /// Restricts a tab list to the selected folder. The pager and the grid must
+  /// both go through this, otherwise a double-tap opens the wrong item.
+  List<SavedMessageItem> _inFolder(List<SavedMessageItem> items) {
+    final ids = widget.folderStore
+        ?.filterIds(FolderScope.telegram, _selectedFolderId);
+    if (ids == null) return items;
+    return [for (final m in items) if (ids.contains('${m.id}')) m];
+  }
+
+  List<SavedMessageItem> get _visibleVideos => _inFolder(_videoMessages);
+  List<SavedMessageItem> get _visibleImages => _inFolder(_imageMessages);
+  List<SavedMessageItem> get _visibleFiles => _inFolder(_fileMessages);
+
   List<SavedMessageItem> get _currentMessages {
     switch (_tabIndex) {
-      case 0: return _videoMessages;
-      case 1: return _imageMessages;
-      default: return _fileMessages;
+      case 0: return _visibleVideos;
+      case 1: return _visibleImages;
+      default: return _visibleFiles;
     }
   }
 
   void _openReel(int index) {
-    final videos = _videoMessages;
+    final videos = _visibleVideos;
     if (index < 0 || index >= videos.length) return;
     Navigator.of(context).push(
       MaterialPageRoute(
@@ -153,7 +247,7 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
   }
 
   void _openPhotos(int index) {
-    final photos = _imageMessages;
+    final photos = _visibleImages;
     if (index < 0 || index >= photos.length) return;
     Navigator.of(context).push(
       MaterialPageRoute(
@@ -168,12 +262,21 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
 
   void _openItem(SavedMessageItem msg) {
     if (msg.mediaType == SavedMediaType.video) {
-      final index = _videoMessages.indexOf(msg);
+      final index = _visibleVideos.indexOf(msg);
       if (index >= 0) _openReel(index);
     } else if (msg.mediaType == SavedMediaType.photo) {
-      final index = _imageMessages.indexOf(msg);
+      final index = _visibleImages.indexOf(msg);
       if (index >= 0) _openPhotos(index);
     }
+  }
+
+  /// What a long-press on [msg] carries: the whole selection when the tapped
+  /// tile is part of it, otherwise just that one item.
+  List<String> _dragPayload(SavedMessageItem msg) {
+    if (_selectedIds.contains(msg.id)) {
+      return [for (final id in _selectedIds) '$id'];
+    }
+    return ['${msg.id}'];
   }
 
   Future<void> _downloadSelected() async {
@@ -215,6 +318,17 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
       appBar: AppBar(
         title: const Text('Telegram'),
         actions: [
+          if (widget.folderStore != null && _selectedIds.isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.folder, color: Colors.amber),
+              tooltip: 'Move to folder',
+              onPressed: () => showMoveToFolderSheet(
+                context,
+                store: widget.folderStore!,
+                scope: FolderScope.telegram,
+                itemIds: [for (final id in _selectedIds) '$id'],
+              ),
+            ),
           if (widget.service.isAuthenticated && _selectedIds.isNotEmpty)
             IconButton(
               icon: const Icon(Icons.download, color: Colors.green),
@@ -313,15 +427,25 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
 
     return Column(
       children: [
+        if (widget.folderStore != null)
+          FolderStrip(
+            store: widget.folderStore!,
+            scope: FolderScope.telegram,
+            selectedId: _selectedFolderId,
+            onSelected: (id) => setState(() {
+              _selectedFolderId = id;
+              _selectedIds.clear();
+            }),
+          ),
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
           child: Row(
             children: [
-              _buildTab(0, 'Videos', _videoMessages.length, Icons.videocam),
+              _buildTab(0, 'Videos', _visibleVideos.length, Icons.videocam),
               const SizedBox(width: 8),
-              _buildTab(1, 'Images', _imageMessages.length, Icons.image),
+              _buildTab(1, 'Images', _visibleImages.length, Icons.image),
               const SizedBox(width: 8),
-              _buildTab(2, 'Files', _fileMessages.length, Icons.insert_drive_file),
+              _buildTab(2, 'Files', _visibleFiles.length, Icons.insert_drive_file),
             ],
           ),
         ),
@@ -364,14 +488,26 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
     final items = _currentMessages;
     final dateFmt = DateFormat('MMM d, HH:mm');
     if (items.isEmpty) {
+      final inFolder = _selectedFolderId != null;
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.cloud_off, size: 48, color: Colors.grey[600]),
+            Icon(inFolder ? Icons.folder_open : Icons.cloud_off,
+                size: 48, color: Colors.grey[600]),
             const SizedBox(height: 12),
-            Text('No ${_tabIndex == 0 ? "videos" : _tabIndex == 1 ? "images" : "files"} found',
-                style: TextStyle(color: Colors.grey[400])),
+            Text(
+              inFolder
+                  ? 'Nothing in this folder yet'
+                  : 'No ${_tabIndex == 0 ? "videos" : _tabIndex == 1 ? "images" : "files"} found',
+              style: TextStyle(color: Colors.grey[400]),
+            ),
+            if (inFolder)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text('Long-press a tile to drag it in here',
+                    style: TextStyle(color: Colors.grey[600], fontSize: 12)),
+              ),
           ],
         ),
       );
@@ -390,7 +526,7 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
         itemBuilder: (_, i) {
           final msg = items[i];
           final selected = _selectedIds.contains(msg.id);
-          return GestureDetector(
+          final tile = GestureDetector(
             onTap: () {
               setState(() {
                 if (selected) {
@@ -421,13 +557,29 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
                           borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
                           child: msg.thumbnailId != null
                               ? FutureBuilder<Uint8List?>(
-                                  future: widget.service.getThumbnail(msg),
+                                  future: _thumbFor(msg),
                                   builder: (_, snap) {
+                                    if (snap.connectionState ==
+                                        ConnectionState.waiting) {
+                                      return Center(
+                                        child: SizedBox(
+                                          width: 22,
+                                          height: 22,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                            color: _colorForType(msg.mediaType),
+                                          ),
+                                        ),
+                                      );
+                                    }
                                     if (snap.hasData && snap.data != null) {
-                                      return Image.memory(snap.data!, fit: BoxFit.cover);
+                                      return Image.memory(snap.data!,
+                                          fit: BoxFit.cover);
                                     }
                                     return Center(
-                                      child: Icon(_iconForType(msg.mediaType), size: 32, color: _colorForType(msg.mediaType)),
+                                      child: Icon(_iconForType(msg.mediaType),
+                                          size: 32,
+                                          color: _colorForType(msg.mediaType)),
                                     );
                                   },
                                 )
@@ -498,11 +650,31 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
                         color: Colors.blue,
                         shape: BoxShape.circle,
                       ),
-                      child: const Icon(Icons.check, color: Colors.white, size: 14),
+                        child: const Icon(Icons.check, color: Colors.white, size: 14),
                     ),
                   ),
               ],
             ),
+          );
+          return LongPressDraggable<List<String>>(
+            data: _dragPayload(msg),
+            feedback: Material(
+              color: Colors.transparent,
+              child: Container(
+                width: 92,
+                height: 116,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: _colorForType(msg.mediaType).withValues(alpha: 0.92),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white24),
+                ),
+                child: Icon(_iconForType(msg.mediaType),
+                    color: Colors.white, size: 36),
+              ),
+            ),
+            childWhenDragging: Opacity(opacity: 0.3, child: tile),
+            child: tile,
           );
         },
       ),

@@ -10,6 +10,8 @@ import '../youtube_uploader.dart';
 import '../services/upload_scheduler.dart';
 import '../services/account_manager.dart';
 import '../services/telegram_service.dart';
+import '../services/folder_store.dart';
+import 'folder_strip.dart';
 import 'reel_player_page.dart';
 
 class UploadQueuePage extends StatefulWidget {
@@ -17,6 +19,7 @@ class UploadQueuePage extends StatefulWidget {
   final AccountManager accountManager;
   final String? accessToken;
   final TelegramService? telegramService;
+  final FolderStore? folderStore;
 
   /// The infinite-scroll loop mounts a second copy of this page as its end
   /// sentinel. That copy shares the scheduler but must never claim jobs —
@@ -29,6 +32,7 @@ class UploadQueuePage extends StatefulWidget {
     required this.accountManager,
     this.accessToken,
     this.telegramService,
+    this.folderStore,
     this.isSentinel = false,
   }) : super(key: key);
 
@@ -36,7 +40,8 @@ class UploadQueuePage extends StatefulWidget {
   State<UploadQueuePage> createState() => _UploadQueuePageState();
 }
 
-class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAliveClientMixin {
+class _UploadQueuePageState extends State<UploadQueuePage>
+    with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
   @override
   bool get wantKeepAlive => true;
   bool _isUploading = false;
@@ -45,26 +50,227 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
   Set<AssetEntity> _selectedForQueue = {};
   bool _showPicker = true;
   final ScrollController _scrollCtrl = ScrollController();
+  final ScrollController _queueScrollCtrl = ScrollController();
   ValueNotifier<String?> _headerDateNotifier = ValueNotifier(null);
   int _localTabIndex = 0;
+
+  /// The Local page sits inside a `PageView`, so its element can be rebuilt
+  /// from scratch whenever the shell refreshes — and then the grid comes back
+  /// at the top even though the user had scrolled halfway down. These live
+  /// outside the State so the new element can pick the position back up.
+  /// Only the real page (never the infinite-scroll sentinel) records state.
+  static double _savedGridOffset = 0;
+  static double _savedQueueOffset = 0;
+  static int _savedTabIndex = 0;
+  static bool _savedShowPicker = true;
+
+  bool _gridRestored = false;
+  bool _queueRestored = false;
+
+  /// Folder the picker grid is filtered to, or `null` for everything.
+  String? _selectedFolderId;
 
   @override
   void initState() {
     super.initState();
+    if (!widget.isSentinel) {
+      _localTabIndex = _savedTabIndex;
+      _showPicker = _savedShowPicker;
+    }
+    WidgetsBinding.instance.addObserver(this);
     widget.scheduler.addListener(_onSchedulerChanged);
-    _scrollCtrl.addListener(_updateCurrentMonth);
-    WidgetsBinding.instance.addPostFrameCallback((_) => _updateCurrentMonth());
+    widget.telegramService?.addListener(_onTelegramChanged);
+    widget.folderStore?.addListener(_onFoldersChanged);
+    _scrollCtrl.addListener(_onGridScrolled);
+    _queueScrollCtrl.addListener(_onQueueScrolled);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _updateCurrentMonth();
+      // Deleting a copy in the official Telegram app is invisible to us
+      // until something asks Telegram about it — do that once the page is
+      // up rather than waiting for the user to visit the Telegram tab.
+      _requestBadgeCheck();
+    });
+    _restoreScrollPosition();
     _loadGallery();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) return;
+    _requestBadgeCheck();
+  }
+
+  void _onFoldersChanged() {
+    if (_isDisposed) return;
+    if (_selectedFolderId != null &&
+        widget.folderStore?.byId(_selectedFolderId) == null) {
+      _selectedFolderId = null;
+    }
+    setState(() {});
   }
 
   @override
   void dispose() {
     _isDisposed = true;
+    WidgetsBinding.instance.removeObserver(this);
     widget.scheduler.removeListener(_onSchedulerChanged);
-    _scrollCtrl.removeListener(_updateCurrentMonth);
+    widget.telegramService?.removeListener(_onTelegramChanged);
+    widget.folderStore?.removeListener(_onFoldersChanged);
+    _scrollCtrl.removeListener(_onGridScrolled);
+    _queueScrollCtrl.removeListener(_onQueueScrolled);
     _scrollCtrl.dispose();
+    _queueScrollCtrl.dispose();
     _headerDateNotifier.dispose();
     super.dispose();
+  }
+
+  void _onGridScrolled() {
+    _updateCurrentMonth();
+    if (widget.isSentinel || !_scrollCtrl.hasClients) return;
+    _savedGridOffset = _scrollCtrl.offset;
+  }
+
+  void _onQueueScrolled() {
+    if (widget.isSentinel || !_queueScrollCtrl.hasClients) return;
+    _savedQueueOffset = _queueScrollCtrl.offset;
+  }
+
+  /// Puts the user back where they were, but only once the list it applies to
+  /// actually exists — jumping any earlier would clamp against a zero extent
+  /// and immediately lose the position again.
+  void _restoreScrollPosition() {
+    if (widget.isSentinel || !mounted) return;
+    // Only bother for the list that is actually on screen; a controller with
+    // no clients would silently swallow the jump and mark it as done.
+    final needGrid = !_gridRestored && _showPicker;
+    final needQueue = !_queueRestored && !_showPicker;
+    if (!needGrid && !needQueue) return;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || widget.isSentinel) return;
+
+      if (!_gridRestored &&
+          _showPicker &&
+          _scrollCtrl.hasClients &&
+          _galleryVideos.isNotEmpty) {
+        _gridRestored = true;
+        final target = _savedGridOffset;
+        final max = _scrollCtrl.position.maxScrollExtent;
+        if (target > 0 && max > 0) {
+          _scrollCtrl.jumpTo(target > max ? max : target);
+        }
+      }
+
+      if (!_queueRestored && !_showPicker && _queueScrollCtrl.hasClients) {
+        _queueRestored = true;
+        final target = _savedQueueOffset;
+        final max = _queueScrollCtrl.position.maxScrollExtent;
+        if (target > 0 && max > 0) {
+          _queueScrollCtrl.jumpTo(target > max ? max : target);
+        }
+      }
+    });
+  }
+
+  /// Switching between the gallery grid and the queue list tears down the
+  /// list that is going away, so its counterpart has to be re-restored when
+  /// it comes back instead of staying marked as done.
+  void _setShowPicker(bool value) {
+    if (!widget.isSentinel) _savedShowPicker = value;
+    setState(() => _showPicker = value);
+    _gridRestored = false;
+    _queueRestored = false;
+    _restoreScrollPosition();
+  }
+
+  void _setLocalTabIndex(int index) {
+    if (!widget.isSentinel) _savedTabIndex = index;
+    // An empty tab replaces the grid with a spinner, which drops the
+    // position — so the next grid build has to put it back.
+    _gridRestored = false;
+    setState(() => _localTabIndex = index);
+    _restoreScrollPosition();
+  }
+
+  /// The Telegram page re-syncs history whenever it loads or refreshes, and
+  /// coming back to the app is the other moment deletions happen. Both must
+  /// re-check uploads against Telegram so the Local TG badge reflects what is
+  /// really still there instead of what was true when the job completed.
+  int _lastCheckedSyncGeneration = -1;
+  bool _verifyingBadges = false;
+  bool _tgRestoreAttempted = false;
+  DateTime _lastBadgeCheck = DateTime.fromMillisecondsSinceEpoch(0);
+
+  void _onTelegramChanged() {
+    if (!mounted) return;
+    setState(() {});
+    final tel = widget.telegramService;
+    if (tel == null || widget.isSentinel) return;
+    // Only a fresh history sync carries new facts; other notifications
+    // (connect, thumbnail cache) must not turn into network traffic.
+    if (tel.syncGeneration != _lastCheckedSyncGeneration) {
+      _requestBadgeCheck(force: true);
+    }
+  }
+
+  /// [force] bypasses the cooldown, used when something actually changed.
+  void _requestBadgeCheck({bool force = false}) {
+    if (!mounted || widget.isSentinel) return;
+    if (widget.telegramService == null) return;
+    if (!force &&
+        DateTime.now().difference(_lastBadgeCheck) <
+            const Duration(seconds: 15)) {
+      return;
+    }
+    _verifyTelegramBadges(widget.telegramService!);
+  }
+
+  Future<void> _verifyTelegramBadges(TelegramService tel) async {
+    if (_verifyingBadges) return;
+    _verifyingBadges = true;
+    _lastBadgeCheck = DateTime.now();
+    try {
+      // The Telegram page is what usually restores the session, but the Local
+      // page has to be able to verify on its own — otherwise the badge can
+      // only ever clear after the user has visited that other tab.
+      if (!tel.isAuthenticated && !_tgRestoreAttempted) {
+        _tgRestoreAttempted = true;
+        try {
+          await tel.tryRestoreSession();
+        } catch (e) {
+          debugPrint('Telegram badge check: session restore failed: $e');
+        }
+      }
+      if (!tel.isAuthenticated) return;
+
+      final jobs = widget.scheduler.jobs
+          .where((j) => j.status == JobStatus.completed && j.uploadedToTelegram)
+          .toList();
+      if (jobs.isEmpty) return;
+
+      final probes = [
+        for (final j in jobs)
+          TelegramUploadProbe(
+            key: j.id,
+            messageId: int.tryParse(j.telegramMessageId ?? ''),
+            title: j.title,
+          ),
+      ];
+
+      final verdict = await tel.verifyUploads(probes);
+      // null = nothing could be verified; keep whatever we already knew
+      // instead of handing every badge back.
+      if (verdict == null) return;
+      _lastCheckedSyncGeneration = tel.syncGeneration;
+      widget.scheduler.applyTelegramVerdict(
+        present: verdict.present,
+        absent: verdict.absent,
+      );
+    } catch (e) {
+      debugPrint('Telegram badge check failed: $e');
+    } finally {
+      _verifyingBadges = false;
+    }
   }
 
   void _onSchedulerChanged() {
@@ -96,6 +302,8 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
         _thumbnailCache.clear();
       });
       WidgetsBinding.instance.addPostFrameCallback((_) => _updateCurrentMonth());
+      _restoreScrollPosition();
+      _requestBadgeCheck();
     }
     _processNextIfNeeded();
   }
@@ -299,7 +507,16 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
           videoHeight: asset?.height ?? 0,
           videoDuration: asset?.duration ?? 0,
         );
-        await widget.scheduler.markCompleted(job.id, telegramMessageId: result.toString());
+        // Record the real message id so the TG badge can later be verified
+        // against Telegram instead of being trusted forever. Only a numeric
+        // id is usable — dumping the raw RPC result here would leave a value
+        // that can never be probed, forcing every upload onto caption search.
+        final sentId = TelegramService.extractSentMessageId(result);
+        await widget.scheduler.markCompleted(
+          job.id,
+          telegramMessageId: sentId?.toString() ?? '',
+        );
+        widget.scheduler.clearDeletedOnTelegram(job.id);
       } else {
         final token = widget.accessToken;
         if (token == null) {
@@ -410,15 +627,23 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
       } else {
         alreadyUploaded.add(j.assetId);
         if (j.uploadedToYoutube) uploadedToYoutube.add(j.assetId);
-        if (j.uploadedToTelegram) uploadedToTelegram.add(j.assetId);
+        if (widget.scheduler.isOnTelegram(j)) uploadedToTelegram.add(j.assetId);
       }
     }
 
-    final filtered = _galleryVideos.where((v) {
+    final folderIds = widget.folderStore
+        ?.filterIds(FolderScope.local, _selectedFolderId);
+    final inFolder = folderIds == null
+        ? _galleryVideos
+        : _galleryVideos.where((v) => folderIds.contains(v.id)).toList();
+
+    final filtered = inFolder.where((v) {
       if (_localTabIndex == 0) return v.type == AssetType.video;
       if (_localTabIndex == 1) return v.type == AssetType.image;
       return v.type == AssetType.audio || v.type == AssetType.other;
     }).toList();
+
+    final inSelectedFolder = _selectedFolderId != null;
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -431,11 +656,22 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
           ),
         ),
         actions: [
+          if (widget.folderStore != null && _selectedForQueue.isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.folder, color: Colors.amber),
+              tooltip: 'Move to folder',
+              onPressed: () => showMoveToFolderSheet(
+                context,
+                store: widget.folderStore!,
+                scope: FolderScope.local,
+                itemIds: [for (final a in _selectedForQueue) a.id],
+              ),
+            ),
           if (_selectedForQueue.where((v) => !alreadyInQueue.contains(v.id) && !alreadyUploaded.contains(v.id)).isNotEmpty)
             TextButton(
               onPressed: () async {
                 await _handleAddToQueue();
-                setState(() => _showPicker = false);
+                _setShowPicker(false);
               },
               child: Text('Add ${_selectedForQueue.where((v) => !alreadyInQueue.contains(v.id) && !alreadyUploaded.contains(v.id)).length} to Queue'),
             ),
@@ -446,11 +682,11 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
             ),
           IconButton(
             icon: const Icon(Icons.queue_rounded),
-            onPressed: () => setState(() => _showPicker = false),
+            onPressed: () => _setShowPicker(false),
           ),
         ],
       ),
-      body: filtered.isEmpty
+      body: _galleryVideos.isEmpty
           ? const Center(child: CircularProgressIndicator())
           : Column(
               children: [
@@ -458,16 +694,56 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
                   padding: EdgeInsets.fromLTRB(12, MediaQuery.of(context).padding.top + kToolbarHeight + 4, 12, 4),
                   child: Row(
                     children: [
-                      _buildLocalTab(0, 'Videos', _galleryVideos.where((v) => v.type == AssetType.video).length, Icons.videocam),
+                      _buildLocalTab(0, 'Videos', inFolder.where((v) => v.type == AssetType.video).length, Icons.videocam),
                       const SizedBox(width: 8),
-                      _buildLocalTab(1, 'Images', _galleryVideos.where((v) => v.type == AssetType.image).length, Icons.image),
+                      _buildLocalTab(1, 'Images', inFolder.where((v) => v.type == AssetType.image).length, Icons.image),
                       const SizedBox(width: 8),
-                      _buildLocalTab(2, 'Files', _galleryVideos.where((v) => v.type == AssetType.audio || v.type == AssetType.other).length, Icons.insert_drive_file),
+                      _buildLocalTab(2, 'Files', inFolder.where((v) => v.type == AssetType.audio || v.type == AssetType.other).length, Icons.insert_drive_file),
                     ],
                   ),
                 ),
+                if (widget.folderStore != null)
+                  FolderStrip(
+                    store: widget.folderStore!,
+                    scope: FolderScope.local,
+                    selectedId: _selectedFolderId,
+                    onSelected: (id) => setState(() {
+                      _selectedFolderId = id;
+                      _selectedForQueue.clear();
+                    }),
+                  ),
                 Expanded(
-                  child: GridView.builder(
+                  child: filtered.isEmpty
+                      ? Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                  inSelectedFolder
+                                      ? Icons.folder_open
+                                      : Icons.perm_media,
+                                  size: 48,
+                                  color: Colors.grey[600]),
+                              const SizedBox(height: 12),
+                              Text(
+                                inSelectedFolder
+                                    ? 'Nothing in this folder yet'
+                                    : 'No ${_localTabIndex == 0 ? 'videos' : _localTabIndex == 1 ? 'images' : 'files'} here',
+                                style: TextStyle(color: Colors.grey[400]),
+                              ),
+                              if (inSelectedFolder)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 6),
+                                  child: Text(
+                                      'Long-press a tile to drag it in here',
+                                      style: TextStyle(
+                                          color: Colors.grey[600],
+                                          fontSize: 12)),
+                                ),
+                            ],
+                          ),
+                        )
+                      : GridView.builder(
                     controller: _scrollCtrl,
                     padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
                     gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
@@ -481,7 +757,7 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
                       final isUploaded = alreadyUploaded.contains(v.id);
                       final onYt = uploadedToYoutube.contains(v.id);
                       final onTg = uploadedToTelegram.contains(v.id);
-                      return GestureDetector(
+                      final tile = GestureDetector(
                         onTap: () {
                           if (inQueue) return;
                           setState(() {
@@ -494,11 +770,21 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
                         },
                         onDoubleTap: () {
                           if (inQueue) return;
+                          // The grid is filtered per tab while the player is
+                          // given one list — the index has to come from that
+                          // exact list or the reel opens on a photo/audio file
+                          // and spins forever.
+                          if (v.type != AssetType.video) return;
+                          final reel = filtered
+                              .where((x) => x.type == AssetType.video)
+                              .toList();
+                          final reelIndex = reel.indexOf(v);
+                          if (reelIndex < 0) return;
                           Navigator.of(context).push(
                             MaterialPageRoute(
                               builder: (_) => ReelPlayerPage(
-                                videos: _galleryVideos,
-                                initialIndex: i,
+                                videos: reel,
+                                initialIndex: reelIndex,
                               ),
                             ),
                           );
@@ -554,6 +840,30 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
                           ],
                         ),
                       );
+                      return LongPressDraggable<List<String>>(
+                        data: selected
+                            ? [for (final a in _selectedForQueue) a.id]
+                            : [v.id],
+                        feedback: Material(
+                          color: Colors.transparent,
+                          child: Container(
+                            width: 92,
+                            height: 116,
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              color: Colors.green.shade700
+                                  .withValues(alpha: 0.92),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.white24),
+                            ),
+                            child: const Icon(Icons.play_arrow,
+                                color: Colors.white, size: 36),
+                          ),
+                        ),
+                        childWhenDragging:
+                            Opacity(opacity: 0.3, child: tile),
+                        child: tile,
+                      );
                     },
                   ),
                 ),
@@ -566,7 +876,7 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
     final selected = _localTabIndex == index;
     return Expanded(
       child: GestureDetector(
-        onTap: () => setState(() => _localTabIndex = index),
+        onTap: () => _setLocalTabIndex(index),
         child: Container(
           padding: const EdgeInsets.symmetric(vertical: 10),
           decoration: BoxDecoration(
@@ -667,7 +977,7 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
             icon: const Icon(Icons.photo_library),
             onPressed: () {
               _loadGallery();
-              setState(() => _showPicker = true);
+              _setShowPicker(true);
             },
           ),
         ],
@@ -688,13 +998,14 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
                     label: const Text('Local'),
                     onPressed: () {
                       _loadGallery();
-                      setState(() => _showPicker = true);
+                      _setShowPicker(true);
                     },
                   ),
                 ],
               ),
             )
           : ListView(
+              controller: _queueScrollCtrl,
               padding: EdgeInsets.only(
                 top: MediaQuery.of(context).padding.top + kToolbarHeight + 12,
                 left: 12, right: 12, bottom: 12),
@@ -826,7 +1137,7 @@ class _UploadQueuePageState extends State<UploadQueuePage> with AutomaticKeepAli
                 decoration: BoxDecoration(color: Colors.red, borderRadius: BorderRadius.circular(3)),
                 child: const Text('YT', style: TextStyle(color: Colors.white, fontSize: 8, fontWeight: FontWeight.bold)),
               ),
-            if (job.uploadedToTelegram)
+            if (widget.scheduler.isOnTelegram(job))
               Container(
                 margin: const EdgeInsets.only(right: 4),
                 padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),

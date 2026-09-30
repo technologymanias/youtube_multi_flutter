@@ -1,11 +1,15 @@
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:photo_manager/photo_manager.dart';
 
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/account_manager.dart';
+import '../services/folder_store.dart';
 import '../youtube_uploader.dart';
+import 'folder_strip.dart';
 import 'video_player_page.dart';
 
 class YoutubeVideoInfo {
@@ -13,6 +17,7 @@ class YoutubeVideoInfo {
   final String title;
   final String? thumbnailUrl;
   final DateTime? publishedAt;
+  final bool isPrivate;
   bool hasLocalCopy;
 
   YoutubeVideoInfo({
@@ -20,18 +25,35 @@ class YoutubeVideoInfo {
     required this.title,
     this.thumbnailUrl,
     this.publishedAt,
+    this.isPrivate = false,
     this.hasLocalCopy = false,
   });
+}
+
+/// Privacy + best thumbnail URL for one video, from videos.list.
+class _VideoMeta {
+  final bool isPrivate;
+  final String? thumbnailUrl;
+
+  const _VideoMeta({required this.isPrivate, required this.thumbnailUrl});
 }
 
 class YoutubeBrowserPage extends StatefulWidget {
   final AccountManager accountManager;
   final Set<String> localVideoTitles;
 
+  /// Maps a YouTube video (by id, falling back to title) to a device
+  /// photo-library asset id, so private videos can show a local frame.
+  final String? Function(String videoId, String title)? resolveLocalAssetId;
+
+  final FolderStore? folderStore;
+
   const YoutubeBrowserPage({
     Key? key,
     required this.accountManager,
     required this.localVideoTitles,
+    this.resolveLocalAssetId,
+    this.folderStore,
   }) : super(key: key);
 
   @override
@@ -48,14 +70,35 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
   final _searchCtrl = TextEditingController();
   final Set<String> _selectedIds = {};
 
+  /// assetId -> device thumbnail bytes (memoized so FutureBuilders are stable).
+  final Map<String, Future<Uint8List?>> _localThumbCache = {};
+
+  /// Thumb URLs that already returned an error this session, so cells stop
+  /// re-firing 404 requests on every rebuild.
+  final Set<String> _failedThumbUrls = {};
+
+  /// Folder the grid is filtered to, or `null` for everything.
+  String? _selectedFolderId;
+
   @override
   void initState() {
     super.initState();
+    widget.folderStore?.addListener(_onFoldersChanged);
     _fetchVideos();
+  }
+
+  void _onFoldersChanged() {
+    if (!mounted) return;
+    if (_selectedFolderId != null &&
+        widget.folderStore?.byId(_selectedFolderId) == null) {
+      _selectedFolderId = null;
+    }
+    setState(() {});
   }
 
   @override
   void dispose() {
+    widget.folderStore?.removeListener(_onFoldersChanged);
     _searchCtrl.dispose();
     super.dispose();
   }
@@ -65,7 +108,7 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
   Future<void> _fetchVideos({bool loadMore = false}) async {
     final token = widget.accountManager.accessToken;
     if (token == null) {
-      setState(() { _loading = false; _error = 'Not signed in'; });
+      setState(() { _loading = false; _loadingMore = false; _error = 'Not signed in'; });
       return;
     }
 
@@ -73,6 +116,7 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
       if (_nextPageToken == null || _loadingMore) return;
       setState(() => _loadingMore = true);
     } else {
+      _failedThumbUrls.clear();
       setState(() { _loading = true; _error = null; });
     }
 
@@ -82,18 +126,18 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
         headers: {'Authorization': 'Bearer $token'},
       );
       if (channelRes.statusCode == 401) {
-        setState(() { _loading = false; _error = 'Session expired. Please re-sign in.'; });
+        setState(() { _loading = false; _loadingMore = false; _error = 'Session expired. Please re-sign in.'; });
         return;
       }
       if (channelRes.statusCode != 200) {
-        setState(() { _loading = false; _error = 'Failed to load channel (${channelRes.statusCode})'; });
+        setState(() { _loading = false; _loadingMore = false; _error = 'Failed to load channel (${channelRes.statusCode})'; });
         return;
       }
 
       final channelData = jsonDecode(channelRes.body);
       final uploadsId = channelData['items']?[0]?['contentDetails']?['relatedPlaylists']?['uploads'] as String?;
       if (uploadsId == null) {
-        setState(() { _loading = false; _error = 'No YouTube channel found. Create one first.'; });
+        setState(() { _loading = false; _loadingMore = false; _error = 'No YouTube channel found. Create one first.'; });
         return;
       }
 
@@ -105,25 +149,44 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
 
       final res = await http.get(Uri.parse(url), headers: {'Authorization': 'Bearer $token'});
       if (res.statusCode != 200) {
-        setState(() { _loading = false; _error = 'Failed to load videos (${res.statusCode})'; });
+        setState(() { _loading = false; _loadingMore = false; _error = 'Failed to load videos (${res.statusCode})'; });
         return;
       }
 
       final data = jsonDecode(res.body);
       final items = data['items'] as List? ?? [];
 
-      final newVideos = items.map<YoutubeVideoInfo>((item) {
+      final rawVideos = items.map((item) {
         final snippet = item['snippet'] as Map? ?? {};
         final title = (snippet['title'] as String?) ?? '';
         final videoId = snippet['resourceId']?['videoId'] as String? ?? '';
+        return {
+          'id': videoId,
+          'title': title,
+          'publishedAt': snippet['publishedAt'] as String?,
+        };
+      }).toList();
+
+      // Private videos have no public thumbnail, so ask videos.list for the
+      // privacy flag and YouTube's own best thumbnail URL (1 quota unit/page).
+      final meta = await _fetchVideoMeta(
+        rawVideos.map((r) => r['id'] as String).toList(),
+      );
+
+      final newVideos = rawVideos.map<YoutubeVideoInfo>((raw) {
+        final videoId = raw['id'] as String;
+        final title = raw['title'] as String;
+        final m = meta[videoId];
         return YoutubeVideoInfo(
           id: videoId,
           title: title,
-          thumbnailUrl: videoId.isNotEmpty
-              ? 'https://img.youtube.com/vi/$videoId/maxresdefault.jpg'
-              : null,
-          publishedAt: snippet['publishedAt'] != null
-              ? DateTime.tryParse(snippet['publishedAt'] as String)
+          thumbnailUrl: m?.thumbnailUrl ??
+              (videoId.isNotEmpty
+                  ? 'https://i.ytimg.com/vi/$videoId/maxresdefault.jpg'
+                  : null),
+          isPrivate: m?.isPrivate ?? false,
+          publishedAt: raw['publishedAt'] != null
+              ? DateTime.tryParse(raw['publishedAt'] as String)
               : null,
           hasLocalCopy: widget.localVideoTitles.contains(title.trim()),
         );
@@ -143,6 +206,138 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
       setState(() { _loading = false; _loadingMore = false; });
     }
   }
+
+  /// Fetches privacy + best thumbnail URL per video. Never throws; on any
+  /// failure the grid falls back to plain public CDN URLs.
+  Future<Map<String, _VideoMeta>> _fetchVideoMeta(List<String> ids) async {
+    final result = <String, _VideoMeta>{};
+    final clean = ids.where((id) => id.isNotEmpty).toList();
+    final token = widget.accountManager.accessToken;
+    if (clean.isEmpty || token == null) return result;
+    try {
+      final res = await http.get(
+        Uri.parse(
+            'https://www.googleapis.com/youtube/v3/videos?part=snippet,status&id=${clean.join(',')}'),
+        headers: {'Authorization': 'Bearer $token'},
+      );
+      if (res.statusCode != 200) return result;
+      final items = jsonDecode(res.body)['items'] as List? ?? [];
+      for (final item in items) {
+        final id = item['id'] as String? ?? '';
+        if (id.isEmpty) continue;
+        final snippet = item['snippet'] as Map?;
+        result[id] = _VideoMeta(
+          isPrivate: (item['status'] as Map?)?['privacyStatus'] == 'private',
+          thumbnailUrl: _bestThumbUrl(snippet?['thumbnails'] as Map?),
+        );
+      }
+    } catch (_) {}
+    return result;
+  }
+
+  String? _bestThumbUrl(Map? thumbs) {
+    if (thumbs == null) return null;
+    for (final key in const ['maxres', 'standard', 'high', 'medium', 'default']) {
+      final url = thumbs[key]?['url'] as String?;
+      if (url != null && url.isNotEmpty) return url;
+    }
+    return null;
+  }
+
+  Future<Uint8List?> _localThumb(String assetId) =>
+      _localThumbCache.putIfAbsent(assetId, () async {
+        try {
+          final asset = await AssetEntity.fromId(assetId);
+          if (asset == null) return null;
+          return await asset.thumbnailDataWithSize(const ThumbnailSize(480, 270));
+        } catch (_) {
+          return null;
+        }
+      });
+
+  List<String> _thumbUrls(YoutubeVideoInfo v) {
+    final urls = <String>[
+      if (v.thumbnailUrl != null && v.thumbnailUrl!.isNotEmpty) v.thumbnailUrl!,
+      'https://i.ytimg.com/vi/${v.id}/maxresdefault.jpg',
+      'https://i.ytimg.com/vi/${v.id}/hqdefault.jpg',
+      'https://i.ytimg.com/vi/${v.id}/mqdefault.jpg',
+    ];
+    return urls.toSet().toList();
+  }
+
+  /// Thumbnail priority:
+  ///  * private + local copy -> device frame (public CDN 404s for private)
+  ///  * private              -> CDN with the saved OAuth session, then lock tile
+  ///  * public               -> CDN, then device frame, then placeholder
+  Widget _buildThumb(YoutubeVideoInfo v) {
+    if (v.id.isEmpty) return _placeholderThumb();
+    final assetId = widget.resolveLocalAssetId?.call(v.id, v.title);
+    final local = assetId == null ? null : _localThumb(assetId);
+
+    if (v.isPrivate) {
+      if (local == null) return _networkThumb(v, withAuth: true, fallback: _lockThumb());
+      return FutureBuilder<Uint8List?>(
+        future: local,
+        builder: (context, snap) {
+          if (snap.connectionState != ConnectionState.done) {
+            return Container(color: Colors.grey[850]);
+          }
+          if (snap.data != null) return Image.memory(snap.data!, fit: BoxFit.cover);
+          return _networkThumb(v, withAuth: true, fallback: _lockThumb());
+        },
+      );
+    }
+
+    final Widget fallback;
+    if (local == null) {
+      fallback = _placeholderThumb();
+    } else {
+      fallback = FutureBuilder<Uint8List?>(
+        future: local,
+        builder: (context, snap) {
+          if (snap.connectionState != ConnectionState.done) {
+            return Container(color: Colors.grey[850]);
+          }
+          if (snap.data != null) return Image.memory(snap.data!, fit: BoxFit.cover);
+          return _placeholderThumb();
+        },
+      );
+    }
+    return _networkThumb(v, withAuth: false, fallback: fallback);
+  }
+
+  Widget _networkThumb(YoutubeVideoInfo v, {required bool withAuth, required Widget fallback}) {
+    final token = widget.accountManager.accessToken;
+    final headers = (withAuth && token != null)
+        ? <String, String>{'Authorization': 'Bearer $token'}
+        : null;
+    return _ThumbChain(
+      urls: _thumbUrls(v),
+      headers: headers,
+      failed: _failedThumbUrls,
+      fallback: fallback,
+    );
+  }
+
+  Widget _lockThumb() => Container(
+        color: Colors.grey[850],
+        alignment: Alignment.center,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.lock, color: Colors.grey[600], size: 24),
+            const SizedBox(height: 4),
+            Text('Private',
+                style: TextStyle(color: Colors.grey[600], fontSize: 9)),
+          ],
+        ),
+      );
+
+  Widget _placeholderThumb() => Container(
+        color: Colors.grey[850],
+        alignment: Alignment.center,
+        child: Icon(Icons.video_library_outlined, color: Colors.grey[700], size: 24),
+      );
 
   void _openVideo(YoutubeVideoInfo video) {
     Navigator.of(context).push(
@@ -214,10 +409,28 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
   @override
   Widget build(BuildContext context) {
     super.build(context);
-    final filtered = _searchCtrl.text.isEmpty
+    final search = _searchCtrl.text.toLowerCase();
+    final searched = search.isEmpty
         ? _videos
-        : _videos.where((v) =>
-            v.title.toLowerCase().contains(_searchCtrl.text.toLowerCase())).toList();
+        : _videos
+            .where((v) => v.title.toLowerCase().contains(search))
+            .toList();
+    final folderIds = widget.folderStore
+        ?.filterIds(FolderScope.youtube, _selectedFolderId);
+    final filtered = folderIds == null
+        ? searched
+        : [for (final v in searched) if (folderIds.contains(v.id)) v];
+
+    String? emptyMessage;
+    if (!_loading && _error == null) {
+      if (_videos.isEmpty) {
+        emptyMessage = 'No videos found';
+      } else if (filtered.isEmpty) {
+        emptyMessage = _selectedFolderId != null
+            ? 'Nothing in this folder yet'
+            : 'No matching videos';
+      }
+    }
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -248,6 +461,17 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
                   ),
                 ),
                 const SizedBox(width: 8),
+                if (widget.folderStore != null && _selectedIds.isNotEmpty)
+                  IconButton(
+                    icon: const Icon(Icons.folder, color: Colors.amber),
+                    tooltip: 'Move to folder',
+                    onPressed: () => showMoveToFolderSheet(
+                      context,
+                      store: widget.folderStore!,
+                      scope: FolderScope.youtube,
+                      itemIds: [..._selectedIds],
+                    ),
+                  ),
                 IconButton(
                   icon: Icon(Icons.download, color: _selectedIds.isNotEmpty ? Colors.green : Colors.grey[500]),
                   onPressed: _downloadSelected,
@@ -255,6 +479,16 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
               ],
             ),
           ),
+          if (widget.folderStore != null)
+            FolderStrip(
+              store: widget.folderStore!,
+              scope: FolderScope.youtube,
+              selectedId: _selectedFolderId,
+              onSelected: (id) => setState(() {
+                _selectedFolderId = id;
+                _selectedIds.clear();
+              }),
+            ),
           Expanded(
             child: _loading
                 ? const Center(child: CircularProgressIndicator())
@@ -279,14 +513,29 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
                           ),
                         ),
                       )
-                    : _videos.isEmpty
+                    : emptyMessage != null
                         ? Center(
                             child: Column(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                Icon(Icons.video_library_outlined, size: 64, color: Colors.grey[600]),
+                                Icon(
+                                    _selectedFolderId != null
+                                        ? Icons.folder_open
+                                        : Icons.video_library_outlined,
+                                    size: 64,
+                                    color: Colors.grey[600]),
                                 const SizedBox(height: 16),
-                                Text('No videos found', style: TextStyle(color: Colors.grey[400])),
+                                Text(emptyMessage,
+                                    style: TextStyle(color: Colors.grey[400])),
+                                if (_selectedFolderId != null)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 6),
+                                    child: Text(
+                                        'Long-press a tile to drag it in here',
+                                        style: TextStyle(
+                                            color: Colors.grey[600],
+                                            fontSize: 12)),
+                                  ),
                               ],
                             ),
                           )
@@ -315,7 +564,7 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
                       }
                       final v = filtered[i];
                       final selected = _selectedIds.contains(v.id);
-                      return GestureDetector(
+                      final tile = GestureDetector(
                         onTap: () {
                           setState(() {
                             if (selected) {
@@ -339,17 +588,7 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
                                   Expanded(
                                     child: ClipRRect(
                                       borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
-                                      child: v.id.isNotEmpty
-                                          ? Image.network(
-                                              'https://img.youtube.com/vi/${v.id}/maxresdefault.jpg',
-                                              fit: BoxFit.cover,
-                                              errorBuilder: (_, __, ___) => Image.network(
-                                                'https://img.youtube.com/vi/${v.id}/hqdefault.jpg',
-                                                fit: BoxFit.cover,
-                                                errorBuilder: (_, __, ___) => Container(color: Colors.grey[800]),
-                                              ),
-                                            )
-                                          : Container(color: Colors.grey[800]),
+                                      child: _buildThumb(v),
                                     ),
                                   ),
                                   Padding(
@@ -389,12 +628,67 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
                           ],
                         ),
                       );
+                      return LongPressDraggable<List<String>>(
+                        data: selected
+                            ? [for (final id in _selectedIds) id]
+                            : [v.id],
+                        feedback: Material(
+                          color: Colors.transparent,
+                          child: Container(
+                            width: 92,
+                            height: 116,
+                            alignment: Alignment.center,
+                            decoration: BoxDecoration(
+                              color: Colors.red.shade700
+                                  .withValues(alpha: 0.92),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.white24),
+                            ),
+                            child: const Icon(Icons.play_arrow,
+                                color: Colors.white, size: 36),
+                          ),
+                        ),
+                        childWhenDragging:
+                            Opacity(opacity: 0.3, child: tile),
+                        child: tile,
+                      );
                     },
                   ),
                 ),
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Tries each thumbnail URL in order; on error moves to the next one and
+/// records the failure in [failed] so rebuilds stop re-requesting dead URLs.
+class _ThumbChain extends StatelessWidget {
+  const _ThumbChain({
+    required this.urls,
+    required this.fallback,
+    this.headers,
+    this.failed,
+  });
+
+  final List<String> urls;
+  final Map<String, String>? headers;
+  final Set<String>? failed;
+  final Widget fallback;
+
+  @override
+  Widget build(BuildContext context) {
+    final pending = urls.where((u) => !(failed?.contains(u) ?? false)).toList();
+    if (pending.isEmpty) return fallback;
+    return Image.network(
+      pending.first,
+      headers: headers,
+      fit: BoxFit.cover,
+      errorBuilder: (_, __, ___) {
+        failed?.add(pending.first);
+        return _ThumbChain(urls: urls, headers: headers, failed: failed, fallback: fallback);
+      },
     );
   }
 }

@@ -530,7 +530,7 @@ class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixi
                 ? all
                 : _historyFilter == 1
                     ? all.where((j) => j.uploadedToYoutube).toList()
-                    : all.where((j) => j.uploadedToTelegram).toList();
+                    : all.where((j) => widget.scheduler.isOnTelegram(j)).toList();
             final totalPages = filtered.isEmpty ? 1 : (filtered.length / _pageSize).ceil();
             final page = _recentPage.clamp(0, totalPages - 1);
             final items = filtered.skip(page * _pageSize).take(_pageSize).toList();
@@ -580,7 +580,7 @@ class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixi
                               decoration: BoxDecoration(color: Colors.red, borderRadius: BorderRadius.circular(3)),
                               child: const Text('YT', style: TextStyle(color: Colors.white, fontSize: 7, fontWeight: FontWeight.bold)),
                             ),
-                          if (job.uploadedToTelegram)
+                          if (widget.scheduler.isOnTelegram(job))
                             Container(
                               margin: const EdgeInsets.only(right: 3),
                               padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),

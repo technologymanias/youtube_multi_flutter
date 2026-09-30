@@ -89,6 +89,12 @@ class _ReelVideoTileState extends State<_ReelVideoTile> {
   VideoPlayerController? _controller;
   bool _initialized = false;
   bool _controlsVisible = false;
+  bool _loading = false;
+  String? _error;
+
+  /// Bumped by every `_initVideo`, so an init that was superseded (swiped
+  /// away and back, or retried) can tell that it must not touch state anymore.
+  int _initSeq = 0;
 
   @override
   void initState() {
@@ -113,33 +119,87 @@ class _ReelVideoTileState extends State<_ReelVideoTile> {
   }
 
   Future<void> _initVideo() async {
-    final file = await widget.entity.file;
-    if (file == null || !mounted) return;
-    _controller = VideoPlayerController.file(file);
-    await _controller!.initialize();
-    if (!mounted) {
-      _controller?.dispose();
-      _controller = null;
-      return;
+    final seq = ++_initSeq;
+    _disposeVideo();
+    if (!mounted) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
+    VideoPlayerController? controller;
+    try {
+      final file = await widget.entity.file;
+      if (file == null) {
+        if (mounted) {
+          setState(() {
+            _loading = false;
+            _error = 'File is not available';
+          });
+        }
+        return;
+      }
+      // Superseded while the file handle was resolving — no controller has
+      // been published yet, so there is nothing to clean up.
+      if (!mounted || !widget.isActive || seq != _initSeq) return;
+
+      controller = VideoPlayerController.file(file);
+      _controller = controller;
+      await controller.initialize().timeout(const Duration(seconds: 30));
+
+      // Everything that clears or replaces `_controller` goes through
+      // `_disposeVideo()`, which has already disposed this instance. Touching
+      // it again would double-dispose a ChangeNotifier.
+      if (!mounted || seq != _initSeq || _controller != controller) return;
+
+      if (controller.value.hasError) {
+        throw StateError(
+            controller.value.errorDescription ?? 'Playback error');
+      }
+      await controller.setLooping(true);
+      await controller.play();
+      if (!mounted || seq != _initSeq || _controller != controller) return;
+      setState(() {
+        _initialized = true;
+        _loading = false;
+      });
+    } catch (e) {
+      debugPrint('[ReelPlayer] init failed: $e');
+      if (controller != null && identical(_controller, controller)) {
+        _disposeVideo();
+      }
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _initialized = false;
+          _error = 'Cannot play this video';
+        });
+      }
     }
-    _controller!.play();
-    _controller!.setLooping(true);
-    if (mounted) setState(() => _initialized = true);
   }
 
   void _disposeVideo() {
-    _controller?.pause();
-    _controller?.dispose();
+    final controller = _controller;
     _controller = null;
     _initialized = false;
+    _loading = false;
+    _controlsVisible = false;
+    if (controller == null) return;
+    try {
+      controller.pause();
+    } catch (_) {}
+    try {
+      controller.dispose();
+    } catch (_) {}
   }
 
   void _togglePlay() {
-    if (_controller == null) return;
-    if (_controller!.value.isPlaying) {
-      _controller!.pause();
+    final controller = _controller;
+    if (controller == null || !_initialized) return;
+    if (controller.value.isPlaying) {
+      controller.pause();
     } else {
-      _controller!.play();
+      controller.play();
     }
     setState(() => _controlsVisible = !_controlsVisible);
   }
@@ -151,7 +211,32 @@ class _ReelVideoTileState extends State<_ReelVideoTile> {
       child: Stack(
         fit: StackFit.expand,
         children: [
-          if (_initialized && _controller != null)
+          if (_error != null)
+            Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.error_outline, size: 48, color: Colors.red[300]),
+                  const SizedBox(height: 12),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 24),
+                    child: Text(
+                      _error!,
+                      style: const TextStyle(color: Colors.white),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextButton.icon(
+                    onPressed: _initVideo,
+                    icon: const Icon(Icons.refresh, color: Colors.white),
+                    label: const Text('Retry',
+                        style: TextStyle(color: Colors.white)),
+                  ),
+                ],
+              ),
+            )
+          else if (_initialized && _controller != null)
             Center(
               child: FittedBox(
                 fit: BoxFit.contain,
@@ -163,8 +248,22 @@ class _ReelVideoTileState extends State<_ReelVideoTile> {
               ),
             )
           else
-            const Center(child: CircularProgressIndicator()),
-          if (_controlsVisible) ...[
+            Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const CircularProgressIndicator(),
+                  if (_loading) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      'Loading…',
+                      style: TextStyle(color: Colors.grey[400], fontSize: 13),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          if (_controlsVisible && _initialized) ...[
             Container(color: Colors.black26),
             Center(
               child: Icon(

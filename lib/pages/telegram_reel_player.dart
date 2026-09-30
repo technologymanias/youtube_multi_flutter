@@ -113,6 +113,10 @@ class _TelegramReelTileState extends State<_TelegramReelTile> {
   bool _loading = false;
   String? _error;
 
+  /// Bumped by every `_initVideo`, so an init that was superseded can tell
+  /// that it must not touch the tile (or its controller) anymore.
+  int _initSeq = 0;
+
   @override
   void initState() {
     super.initState();
@@ -136,46 +140,119 @@ class _TelegramReelTileState extends State<_TelegramReelTile> {
   }
 
   Future<void> _initVideo() async {
-    setState(() { _loading = true; _error = null; });
+    final seq = ++_initSeq;
+    _disposeVideo();
+    if (!mounted) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
     final url = widget.service.streamUrlFor(widget.item);
     debugPrint('[ReelTile] url=$url');
     if (url == null) {
-      if (mounted) setState(() { _loading = false; _error = 'Stream unavailable'; });
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = 'Stream unavailable';
+        });
+      }
       return;
     }
-    try {
-      _controller = VideoPlayerController.networkUrl(Uri.parse(url));
-      debugPrint('[ReelTile] initializing...');
-      await _controller!.initialize();
-      debugPrint('[ReelTile] initialized');
-      if (!mounted) {
-        _controller?.dispose();
-        _controller = null;
+
+    Object? lastError;
+    // First shot normally succeeds; the second one covers the local stream
+    // server hiccuping (or a stale file reference) during the very first
+    // AVFoundation probe, which is what produced the CoreMedia failures.
+    for (var attempt = 0; attempt < 2; attempt++) {
+      VideoPlayerController? controller;
+      try {
+        if (attempt > 0) {
+          await Future.delayed(const Duration(milliseconds: 300));
+          if (!mounted || seq != _initSeq) return;
+        }
+        controller = VideoPlayerController.networkUrl(Uri.parse(url));
+        _controller = controller;
+        debugPrint('[ReelTile] initializing (attempt ${attempt + 1})...');
+        await controller.initialize().timeout(const Duration(seconds: 30));
+        debugPrint('[ReelTile] initialized');
+        // `_disposeVideo()` owns disposal of anything published to
+        // `_controller`; touching it here would double-dispose it.
+        if (!mounted || seq != _initSeq || _controller != controller) return;
+        if (controller.value.hasError) {
+          throw StateError(
+              controller.value.errorDescription ?? 'Playback error');
+        }
+        await controller.setLooping(true);
+        await controller.play();
+        if (!mounted || seq != _initSeq || _controller != controller) return;
+        setState(() {
+          _initialized = true;
+          _loading = false;
+        });
         return;
+      } catch (e) {
+        debugPrint('[ReelTile] error (attempt ${attempt + 1}): $e');
+        lastError = e;
+        if (controller != null && identical(_controller, controller)) {
+          _controller = null;
+          try {
+            controller.pause();
+          } catch (_) {}
+          try {
+            controller.dispose();
+          } catch (_) {}
+        }
+        _initialized = false;
       }
-      _controller!.play();
-      _controller!.setLooping(true);
-      setState(() { _initialized = true; _loading = false; });
-    } catch (e) {
-      debugPrint('[ReelTile] error: $e');
-      if (mounted) setState(() { _loading = false; _error = 'Failed: $e'; });
     }
+
+    if (mounted) {
+      setState(() {
+        _loading = false;
+        _error = _friendlyPlaybackError(lastError);
+      });
+    }
+  }
+
+  String _friendlyPlaybackError(Object? e) {
+    if (e == null) return 'Failed to play this video';
+    final s = e.toString().toLowerCase();
+    if (s.contains('coremedia') ||
+        s.contains('avfoundation') ||
+        s.contains('nsurlerrordomain') ||
+        s.contains('operation couldn') ||
+        s.contains('not correctly configured')) {
+      return 'Could not read this video stream.\nTap Retry to reconnect.';
+    }
+    if (s.contains('file_reference')) {
+      return 'Telegram expired this file reference.\nTap Retry to refresh it.';
+    }
+    return 'Failed to play: $e';
   }
 
   void _disposeVideo() {
-    _controller?.pause();
-    _controller?.dispose();
+    final controller = _controller;
     _controller = null;
     _initialized = false;
     _loading = false;
+    _controlsVisible = false;
+    if (controller == null) return;
+    try {
+      controller.pause();
+    } catch (_) {}
+    try {
+      controller.dispose();
+    } catch (_) {}
   }
 
   void _togglePlay() {
-    if (_controller == null) return;
-    if (_controller!.value.isPlaying) {
-      _controller!.pause();
+    final controller = _controller;
+    if (controller == null || !_initialized) return;
+    if (controller.value.isPlaying) {
+      controller.pause();
     } else {
-      _controller!.play();
+      controller.play();
     }
     setState(() => _controlsVisible = !_controlsVisible);
   }
@@ -194,7 +271,21 @@ class _TelegramReelTileState extends State<_TelegramReelTile> {
                 children: [
                   Icon(Icons.error_outline, size: 48, color: Colors.red[300]),
                   const SizedBox(height: 12),
-                  Text(_error!, style: const TextStyle(color: Colors.white)),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 24),
+                    child: Text(
+                      _error!,
+                      style: const TextStyle(color: Colors.white),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextButton.icon(
+                    onPressed: _initVideo,
+                    icon: const Icon(Icons.refresh, color: Colors.white),
+                    label: const Text('Retry',
+                        style: TextStyle(color: Colors.white)),
+                  ),
                 ],
               ),
             )
