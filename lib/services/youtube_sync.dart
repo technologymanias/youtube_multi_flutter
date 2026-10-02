@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import 'media_index.dart';
+
 /// One entry of the upload queue that should be checked against YouTube.
 class YoutubeUploadProbe {
   const YoutubeUploadProbe({required this.key, this.videoId, this.title});
@@ -121,8 +123,12 @@ class YoutubeSync {
     if (byTitle.isNotEmpty) {
       final titles = await _uploadsTitles(token, headers);
       if (titles != null) {
+        // Remote titles now carry the `[a1b2c3d4]` UUID tag; local probe
+        // titles do not. Compare tag-stripped forms so a tagged upload still
+        // verifies as present.
+        final normalized = {for (final t in titles) MediaIndex.stripTag(t)};
         for (final p in byTitle) {
-          if (titles.contains(p.title!.trim())) {
+          if (normalized.contains(MediaIndex.stripTag(p.title!))) {
             present.add(p.key);
           } else {
             absent.add(p.key);

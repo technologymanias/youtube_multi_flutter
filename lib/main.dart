@@ -10,8 +10,10 @@ import 'services/upload_scheduler.dart';
 import 'services/background_service.dart';
 import 'services/telegram_service.dart';
 import 'services/folder_store.dart';
+import 'services/media_index.dart';
 import 'services/master_sync.dart';
 import 'pages/upload_queue_page.dart';
+import 'pages/uuid_backfill_page.dart';
 import 'pages/youtube_browser_page.dart';
 import 'pages/stats_page.dart';
 import 'pages/telegram_page.dart';
@@ -53,6 +55,10 @@ final GoogleSignIn googleSignIn = GoogleSignIn(
     'email',
     'https://www.googleapis.com/auth/youtube.upload',
     'https://www.googleapis.com/auth/youtube.readonly',
+    // Needed only by the UUID back-fill: rewriting an existing video's title
+    // is a `videos.update` call, which `youtube.upload` does not cover. Adding
+    // a scope invalidates the stored grant, so the user re-consents once.
+    'https://www.googleapis.com/auth/youtube',
     'https://www.googleapis.com/auth/userinfo.email',
     'https://www.googleapis.com/auth/userinfo.profile',
   ],
@@ -89,6 +95,9 @@ class _MainShellState extends State<MainShell> {
 
   Future<void> _init() async {
     try {
+      // The UUID registry must be readable before the queue loads: startup
+      // migration assigns identities to jobs that predate the UUID work.
+      await MediaIndex.instance.ensureLoaded();
       await _scheduler.init();
       await _accountManager.init();
     } catch (_) {
@@ -158,10 +167,14 @@ class _MainShellState extends State<MainShell> {
     super.dispose();
   }
 
+  /// Titles shown for local-vs-remote matching. Tag-stripped so a YouTube
+  /// title that now carries a `[a1b2c3d4]` UUID tag still pairs with its
+  /// queue row.
   Set<String> _buildLocalTitles() {
     final titles = <String>{};
     for (final job in _scheduler.jobs) {
-      titles.add(job.title.trim());
+      final t = MediaIndex.stripTag(job.title).trim();
+      if (t.isNotEmpty) titles.add(t);
     }
     return titles;
   }
@@ -170,14 +183,22 @@ class _MainShellState extends State<MainShell> {
   /// can show a local frame when YouTube has no public thumbnail (private).
   String? _resolveLocalAssetId(String videoId, String title) {
     if (videoId.isNotEmpty) {
+      final byRemote = MediaIndex.instance.byYoutubeVideoId(videoId);
+      if (byRemote?.assetId != null) return byRemote!.assetId;
       for (final job in _scheduler.jobs) {
         if (job.youtubeVideoId == videoId) return job.assetId;
       }
     }
-    final trimmed = title.trim();
+    // Prefer the UUID tag: it is exact even when two uploads share a title.
+    final tag = MediaIndex.parseTag(title);
+    if (tag != null) {
+      final byTag = MediaIndex.instance.byShortTag(tag);
+      if (byTag?.assetId != null) return byTag!.assetId;
+    }
+    final trimmed = MediaIndex.stripTag(title).trim();
     if (trimmed.isEmpty) return null;
     for (final job in _scheduler.jobs) {
-      if (job.title.trim() == trimmed) return job.assetId;
+      if (MediaIndex.stripTag(job.title).trim() == trimmed) return job.assetId;
     }
     return null;
   }
@@ -435,6 +456,28 @@ class _MainShellState extends State<MainShell> {
               style: TextStyle(color: Colors.grey[400], fontSize: 12),
             ),
             onTap: () => showFolderBackupDialog(context, _folderStore),
+          ),
+
+          // UUID back-fill for uploads that predate the UUID work.
+          ListTile(
+            leading: const Icon(Icons.fingerprint),
+            title: const Text('UUID back-fill'),
+            subtitle: Text(
+              '${MediaIndex.instance.length} item${MediaIndex.instance.length == 1 ? '' : 's'} identified',
+              style: TextStyle(color: Colors.grey[400], fontSize: 12),
+            ),
+            onTap: () {
+              Navigator.pop(context);
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => UuidBackfillPage(
+                    scheduler: _scheduler,
+                    accountManager: _accountManager,
+                    telegramService: _telegramService,
+                  ),
+                ),
+              );
+            },
           ),
 
           // Channel selector

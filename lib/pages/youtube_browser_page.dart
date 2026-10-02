@@ -7,6 +7,7 @@ import 'package:photo_manager/photo_manager.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../services/account_manager.dart';
+import '../services/media_index.dart';
 import '../services/folder_store.dart';
 import '../youtube_uploader.dart';
 import 'folder_strip.dart';
@@ -105,6 +106,19 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
 
   String? _error;
 
+  /// Whether a remote YouTube title refers to something already in the queue.
+  ///
+  /// The UUID tag is the authoritative link when present; otherwise fall back
+  /// to a tag-stripped title comparison so pre-tag uploads still match.
+  bool _hasLocal(String remoteTitle) {
+    final tag = MediaIndex.parseTag(remoteTitle);
+    if (tag != null && MediaIndex.instance.byShortTag(tag) != null) {
+      return true;
+    }
+    final stripped = MediaIndex.stripTag(remoteTitle).trim();
+    return stripped.isNotEmpty && widget.localVideoTitles.contains(stripped);
+  }
+
   Future<void> _fetchVideos({bool loadMore = false}) async {
     final token = widget.accountManager.accessToken;
     if (token == null) {
@@ -188,7 +202,7 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
           publishedAt: raw['publishedAt'] != null
               ? DateTime.tryParse(raw['publishedAt'] as String)
               : null,
-          hasLocalCopy: widget.localVideoTitles.contains(title.trim()),
+          hasLocalCopy: _hasLocal(title),
         );
       }).toList();
 
@@ -196,8 +210,7 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
         if (loadMore) {
           _videos.addAll(newVideos);
         } else {
-          _videos = newVideos;
-        }
+          _videos = newVideos;        }
         _nextPageToken = data['nextPageToken'] as String?;
         _loading = false;
         _loadingMore = false;

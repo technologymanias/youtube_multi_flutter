@@ -212,6 +212,81 @@ class YouTubeUploader {
     throw Exception('Upload failed after maximum retries');
   }
 
+  /// Quota cost of one [updateVideoTitle] (YouTube charges 50 units for any
+  /// write to `videos`), exposed so the back-fill screen can warn before it
+  /// starts rather than after the daily budget is gone.
+  static const int updateQuotaCost = 50;
+
+  /// The full `snippet` currently on [videoId], or null when the video is not
+  /// visible to this token or the request failed.
+  ///
+  /// Required before any update: `videos.update` with `part=snippet` replaces
+  /// the whole snippet, so every omitted field — `categoryId` above all, which
+  /// the API insists on — would otherwise be cleared.
+  Future<Map<String, dynamic>?> getVideoSnippet(String videoId) async {
+    final res = await http.get(
+      Uri.parse(
+          'https://www.googleapis.com/youtube/v3/videos?part=snippet&id=$videoId'),
+      headers: {'Authorization': 'Bearer $accessToken'},
+    );
+    if (res.statusCode != 200) return null;
+    final items = (jsonDecode(res.body)['items'] as List?) ?? const [];
+    if (items.isEmpty) return null;
+    final snippet = items.first['snippet'];
+    return snippet is Map ? Map<String, dynamic>.from(snippet) : null;
+  }
+
+  /// Rewrites only the title of an existing video, leaving description, tags,
+  /// categoryId, privacy and playlist placement untouched.
+  ///
+  /// Read-modify-write: the current snippet is fetched first and re-sent
+  /// verbatim with a new title, because YouTube treats `part=snippet` as a
+  /// full replacement.
+  Future<bool> updateVideoTitle(
+    String videoId,
+    String newTitle, {
+    int maxRetries = 3,
+  }) async {
+    if (videoId.isEmpty) return false;
+    if (newTitle.isEmpty) {
+      throw ArgumentError.value(newTitle, 'newTitle', 'must not be empty');
+    }
+    if (newTitle.length > 100) {
+      // Better to fail loudly and let the caller re-fit the tag than to
+      // silently upload a truncated title that no longer round-trips.
+      throw ArgumentError.value(
+          newTitle, 'newTitle', 'exceeds the 100-character YouTube limit');
+    }
+
+    for (var attempt = 1;; attempt++) {
+      try {
+        final snippet = await getVideoSnippet(videoId);
+        if (snippet == null) return false;
+
+        snippet['title'] = newTitle;
+
+        final res = await http.put(
+          Uri.parse('https://www.googleapis.com/youtube/v3/videos?part=snippet'),
+          headers: {
+            'Authorization': 'Bearer $accessToken',
+            'Content-Type': 'application/json; charset=UTF-8',
+          },
+          body: jsonEncode({'id': videoId, 'snippet': snippet}),
+        );
+        if (res.statusCode == 200 || res.statusCode == 204) return true;
+        if (res.statusCode == 403 || res.statusCode == 401) {
+          // Scope/quota problems do not get better on retry.
+          throw Exception('YouTube refused the title update '
+              '(${res.statusCode}): ${res.body}');
+        }
+        throw Exception('Title update failed: ${res.statusCode} ${res.body}');
+      } catch (e) {
+        if (attempt >= maxRetries) rethrow;
+        await Future.delayed(Duration(seconds: 2 * attempt));
+      }
+    }
+  }
+
   Future<List<Map<String, String>>> listPlaylists() async {
     final res = await http.get(
       Uri.parse('https://www.googleapis.com/youtube/v3/playlists?part=snippet&mine=true&maxResults=50'),

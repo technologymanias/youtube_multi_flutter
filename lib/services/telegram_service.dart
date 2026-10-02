@@ -8,6 +8,7 @@ import 'package:t/t.dart' as t;
 import 'package:tg/tg.dart' as tg;
 
 import 'telegram_socket.dart';
+import 'media_index.dart';
 import 'upload_scheduler.dart';
 
 class TelegramService extends ChangeNotifier {
@@ -1330,7 +1331,12 @@ class TelegramService extends ChangeNotifier {
         peer = const t.InputPeerSelf();
       }
       for (final p in titleProbes) {
-        final needle = p.title!.trim();
+        // Prefer the UUID tag when the probe carries one: eight hex
+        // characters are effectively unique in Saved Messages, where a date
+        // title will match several uploads.
+        final tag = MediaIndex.parseTag(p.title!);
+        final needle = (tag ?? MediaIndex.stripTag(p.title!)).trim();
+        if (needle.isEmpty) continue;
         try {
           final res = await _client!.messages
               .search(
@@ -1409,13 +1415,73 @@ class TelegramService extends ChangeNotifier {
     return [for (final v in values) if (seen.add(v)) v];
   }
 
+  /// Rewrites the caption of an already-sent Saved Messages entry.
+  ///
+  /// `media` is deliberately left null: Telegram then treats this as a text
+  /// edit and keeps the photo/video/document exactly as it was, which is what
+  /// a UUID back-fill needs — only the caption changes, and the message keeps
+  /// its id, date and file.
+  ///
+  /// Returns true when Telegram confirmed the edit.
+  Future<bool> editMessageCaption(int messageId, String newCaption) async {
+    if (messageId <= 0) return false;
+    await ensureConnected();
+    final res = await _client!.messages
+        .editMessage(
+          noWebpage: false,
+          invertMedia: false,
+          peer: const t.InputPeerSelf(),
+          id: messageId,
+          message: newCaption,
+        )
+        .timeout(const Duration(seconds: 30));
+    if (res.error != null) {
+      throw Exception(
+          'Telegram ${res.error!.errorCode}: ${res.error!.errorMessage}');
+    }
+    // Refresh whatever the page is showing so the new caption is not
+    // overwritten by a stale cache on the next scroll.
+    for (var i = 0; i < _lastFetchedMessages.length; i++) {
+      if (_lastFetchedMessages[i].id == messageId) {
+        _lastFetchedMessages[i] = _copyCaption(_lastFetchedMessages[i], newCaption);
+        break;
+      }
+    }
+    _syncGeneration++;
+    notifyListeners();
+    return true;
+  }
+
+  SavedMessageItem _copyCaption(SavedMessageItem src, String caption) =>
+      SavedMessageItem(
+        id: src.id,
+        date: src.date,
+        caption: caption,
+        mediaType: src.mediaType,
+        fileSize: src.fileSize,
+        mimeType: src.mimeType,
+        fileName: src.fileName,
+        hasLocalCopy: src.hasLocalCopy,
+      )
+        ..thumbnailId = src.thumbnailId
+        ..thumbnailAccessHash = src.thumbnailAccessHash
+        ..thumbnailFileReference = src.thumbnailFileReference
+        ..thumbSize = src.thumbSize
+        ..thumbSizes = src.thumbSizes
+        ..dcId = src.dcId
+        ..fullSizeType = src.fullSizeType;
+
   bool _captionMatchesFetched(String title) {
-    final needle = title.trim();
+    final needle = MediaIndex.stripTag(title);
     if (needle.isEmpty) return true;
     for (final m in _lastFetchedMessages) {
-      final caption = m.caption?.trim() ?? '';
+      // Captions now end in a `[a1b2c3d4]` tag, so compare stripped forms —
+      // otherwise every tagged upload would look deleted.
+      final caption = MediaIndex.stripTag(m.caption ?? '');
       if (caption.isEmpty) continue;
-      if (caption == needle || caption.endsWith(needle)) return true;
+      if (caption == needle) return true;
+      final tag = MediaIndex.parseTag(m.caption);
+      if (tag != null && MediaIndex.parseTag(title) == tag) return true;
     }
     return false;
   }
@@ -1491,6 +1557,17 @@ class TelegramService extends ChangeNotifier {
               item.fileSize = doc.size;
               item.mimeType = doc.mimeType;
               item.dcId = doc.dcId;
+
+              // The original filename. Written on every upload we make, but
+              // it was never read back — without it a document's caption is
+              // just a date string and there is nothing to match on.
+              for (final attr in doc.attributes) {
+                if (attr is t.DocumentAttributeFilename) {
+                  final name = attr.fileName;
+                  if (name.isNotEmpty) item.fileName = name;
+                  break;
+                }
+              }
 
               // Telegram stores frame captures in `videoThumbs` (types like
               // "i"/"j") and extension thumbnails in `thumbs` (types like
@@ -2212,6 +2289,13 @@ class SavedMessageItem {
   String? mimeType;
   bool hasLocalCopy;
 
+  /// Original filename, read from the document's `DocumentAttributeFilename`.
+  ///
+  /// Telegram captions are the date-formatted title, so this is the only
+  /// field that still resembles the file on disk — which makes it the strongest
+  /// signal for matching a message back to a local asset during UUID back-fill.
+  String? fileName;
+
   SavedMessageItem({
     required this.id,
     required this.date,
@@ -2219,8 +2303,12 @@ class SavedMessageItem {
     required this.mediaType,
     this.fileSize,
     this.mimeType,
+    this.fileName,
     this.hasLocalCopy = false,
   });
+
+  /// The UUID tag this message already carries, if any.
+  String? get shortTag => MediaIndex.parseTag(caption);
 }
 
 /// One entry of the upload queue that should be checked against Telegram.

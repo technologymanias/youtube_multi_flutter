@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'background_service.dart';
+import 'media_index.dart';
 
 enum JobStatus { pending, uploading, completed, failed, scheduled }
 
@@ -14,6 +15,19 @@ class UploadJob {
   final String assetId;
   String title;
   final String? filePath;
+
+  /// Cross-platform identity for this media item. Assigned when the job is
+  /// created and reused for every destination, so the same file lands in the
+  /// YouTube title and the Telegram caption carrying the *same* UUID.
+  /// Nullable only for jobs written by a build that predates the UUID work —
+  /// [UploadScheduler.load] back-fills them on startup.
+  String? uuid;
+
+  /// The 8-character display form of [uuid] (`[a1b2c3d4]`). Stored so the
+  /// queue UI never has to re-derive it, and so a title already carrying the
+  /// tag stays byte-identical across restarts.
+  String? shortTag;
+
   JobStatus status;
   double progress;
   DateTime? scheduledDate;
@@ -37,6 +51,8 @@ class UploadJob {
     required this.assetId,
     required this.title,
     this.filePath,
+    this.uuid,
+    this.shortTag,
     this.status = JobStatus.pending,
     this.progress = 0,
     this.scheduledDate,
@@ -57,6 +73,8 @@ class UploadJob {
     'assetId': assetId,
     'title': title,
     'filePath': filePath,
+    'uuid': uuid,
+    'shortTag': shortTag,
     'status': status.index,
     'progress': progress,
     'scheduledDate': scheduledDate?.toIso8601String(),
@@ -77,6 +95,8 @@ class UploadJob {
     assetId: json['assetId'] as String,
     title: json['title'] as String,
     filePath: json['filePath'] as String?,
+    uuid: json['uuid'] as String?,
+    shortTag: json['shortTag'] as String?,
     status: JobStatus.values[json['status'] as int],
     progress: (json['progress'] as num).toDouble(),
     scheduledDate: json['scheduledDate'] != null ? DateTime.parse(json['scheduledDate'] as String) : null,
@@ -96,6 +116,12 @@ class UploadJob {
 
   String get displayName =>
       title.isNotEmpty ? title : (filePath != null ? filePath!.split('/').last : assetId);
+
+  /// The title as it must be sent to a destination: base title plus the short
+  /// UUID tag (`02 October 2026 15:30 [a1b2c3d4]`). Identical for YouTube and
+  /// Telegram — that byte-identity is what lets one be matched to the other —
+  /// and capped at 100 characters because that is YouTube's title limit.
+  String get taggedTitle => MediaIndex.fitTitle(title, shortTag);
 
   bool get uploadedToYoutube => destination == UploadDestination.youtube || destination == UploadDestination.both;
   bool get uploadedToTelegram => destination == UploadDestination.telegram || destination == UploadDestination.both;
@@ -362,8 +388,62 @@ class UploadScheduler extends ChangeNotifier {
     final known = {for (final j in _jobs) j.id};
     _deletedTelegramJobIds.removeWhere((id) => !known.contains(id));
     _deletedYoutubeJobIds.removeWhere((id) => !known.contains(id));
+    await _backfillUuids();
     _rescheduleAfterRestart();
     notifyListeners();
+  }
+
+  /// Gives every job a UUID.
+  ///
+  /// Three cases, in order:
+  ///  1. The job already carries a `uuid` from a previous run — nothing to do.
+  ///  2. The title already ends in a `[a1b2c3d4]` tag (a run that crashed
+  ///     after uploading but before persisting the id) — adopt that tag's
+  ///     UUID if it is in the index, otherwise parse it as the short tag.
+  ///  3. Legacy job with no UUID at all — ask the index, which **reuses the
+  ///     asset's existing entry** so a file uploaded to YouTube last week and
+  ///     queued for Telegram this week end up sharing one id.
+  Future<void> _backfillUuids() async {
+    final index = MediaIndex.instance;
+    await index.ensureLoaded();
+    var changed = 0;
+
+    for (final job in _jobs) {
+      if (job.uuid != null && job.uuid!.isNotEmpty) {
+        if (job.shortTag == null || job.shortTag!.isEmpty) {
+          job.shortTag = index.byUuid(job.uuid!)?.shortTag;
+        }
+        continue;
+      }
+
+      final tagged = MediaIndex.parseTag(job.title);
+      MediaIdentity? identity;
+      if (tagged != null) {
+        identity = index.byShortTag(tagged);
+        job.shortTag = tagged;
+      }
+      identity ??= await index.resolveOrCreate(
+        assetId: job.assetId,
+        title: MediaIndex.stripTag(job.title),
+        fileName: job.filePath?.split('/').last,
+        fileSize: null,
+      );
+      job.uuid = identity.uuid;
+      job.shortTag = identity.shortTag;
+      // Keep the stored title canonical (tag-free); the tag is applied at
+      // send time by [UploadJob.taggedTitle].
+      final clean = MediaIndex.stripTag(job.title);
+      if (clean != job.title) {
+        job.title = clean;
+      }
+      changed++;
+    }
+
+    if (changed > 0) {
+      await index.flush();
+      await _save();
+      debugPrint('[Queue] back-filled UUID on $changed job(s)');
+    }
   }
 
   Future<void> _save() async {
@@ -469,6 +549,8 @@ class UploadScheduler extends ChangeNotifier {
   /// which are not filed anywhere — stay untagged.
   Future<void> addJobs(List<Map<String, String>> videos, String channelId, String accountEmail, {UploadDestination destination = UploadDestination.youtube, String? folder}) async {
     final today = DateTime.now();
+    final index = MediaIndex.instance;
+    await index.ensureLoaded();
 
     if (destination == UploadDestination.telegram) {
       for (final video in videos) {
@@ -482,6 +564,7 @@ class UploadScheduler extends ChangeNotifier {
           destination: destination,
           folder: folder,
         );
+        await _assignUuid(job, index, video);
         _jobs.add(job);
       }
     } else {
@@ -514,6 +597,7 @@ class UploadScheduler extends ChangeNotifier {
           destination: destination,
           folder: folder,
         );
+        await _assignUuid(job, index, video);
 
         if (dayOffset > 0) {
           job.status = JobStatus.scheduled;
@@ -525,6 +609,26 @@ class UploadScheduler extends ChangeNotifier {
     }
     await _save();
     notifyListeners();
+  }
+
+  /// Stamps [job] with the UUID for its asset.
+  ///
+  /// The index is asked first, so re-queueing a file that was already sent
+  /// (to either destination) re-uses the id it already wears — YouTube and
+  /// Telegram then carry the same tag without any further coordination.
+  Future<void> _assignUuid(
+    UploadJob job,
+    MediaIndex index,
+    Map<String, String> video,
+  ) async {
+    final identity = await index.resolveOrCreate(
+      assetId: job.assetId,
+      title: MediaIndex.stripTag(video['title'] ?? job.title),
+      fileName: video['filePath']?.split('/').last,
+    );
+    job.uuid = identity.uuid;
+    job.shortTag = identity.shortTag;
+    job.title = MediaIndex.stripTag(job.title);
   }
 
   UploadJob? claimNext() {

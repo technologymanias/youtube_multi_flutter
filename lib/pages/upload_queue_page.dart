@@ -8,6 +8,7 @@ import 'package:fluttertoast/fluttertoast.dart';
 
 import '../youtube_uploader.dart';
 import '../services/upload_scheduler.dart';
+import '../services/media_index.dart';
 import '../services/account_manager.dart';
 import '../services/telegram_service.dart';
 import '../services/youtube_sync.dart';
@@ -315,7 +316,9 @@ class _UploadQueuePageState extends State<UploadQueuePage>
           YoutubeUploadProbe(
             key: j.id,
             videoId: j.youtubeVideoId,
-            title: j.title,
+            // Tagged form: the probe then searches for the UUID, which is
+            // unique, instead of a date title that can collide with others.
+            title: j.taggedTitle,
           ),
       ];
 
@@ -361,7 +364,7 @@ class _UploadQueuePageState extends State<UploadQueuePage>
           TelegramUploadProbe(
             key: j.id,
             messageId: int.tryParse(j.telegramMessageId ?? ''),
-            title: j.title,
+            title: j.taggedTitle,
           ),
       ];
 
@@ -778,9 +781,11 @@ class _UploadQueuePageState extends State<UploadQueuePage>
           _processNextIfNeeded();
           return;
         }
+        // The short UUID tag rides on the caption exactly as it does on the
+        // YouTube title, so the two remote copies identify the same item.
         final tgCaption = job.folder != null && job.folder!.isNotEmpty
-            ? '#${job.folder!.replaceAll(' ', '_')}\n${job.title}'
-            : job.title;
+            ? '#${job.folder!.replaceAll(' ', '_')}\n${job.taggedTitle}'
+            : job.taggedTitle;
         final result = await tel.uploadToSavedMessages(
           file.path,
           caption: tgCaption,
@@ -803,6 +808,14 @@ class _UploadQueuePageState extends State<UploadQueuePage>
           // follows the phone number signed in, not the device.
           telegramAccountId: tel.accountKey ?? '',
         );
+        if (sentId != null && job.uuid != null) {
+          await MediaIndex.instance.link(
+            uuid: job.uuid!,
+            telegramMessageId: sentId.toString(),
+            telegramAccountKey: tel.accountKey ?? '',
+            title: job.title,
+          );
+        }
         widget.scheduler.clearDeletedOnTelegram(job.id);
       } else {
         final token = widget.accessToken;
@@ -818,10 +831,18 @@ class _UploadQueuePageState extends State<UploadQueuePage>
 
         final videoId = await uploader.uploadResumable(
           videoBytes: bytes,
-          title: job.title,
+          title: job.taggedTitle,
           description: 'Uploaded via Flutter app',
           onProgress: (p) => widget.scheduler.markProgress(job.id, p),
         );
+
+        if (videoId != null && videoId.isNotEmpty) {
+          await MediaIndex.instance.link(
+            uuid: job.uuid ?? '',
+            youtubeVideoId: videoId,
+            title: job.title,
+          );
+        }
 
         if (videoId != null && job.folder != null && job.folder!.isNotEmpty) {
           try {
