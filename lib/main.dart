@@ -10,6 +10,7 @@ import 'services/upload_scheduler.dart';
 import 'services/background_service.dart';
 import 'services/telegram_service.dart';
 import 'services/folder_store.dart';
+import 'services/master_sync.dart';
 import 'pages/upload_queue_page.dart';
 import 'pages/youtube_browser_page.dart';
 import 'pages/stats_page.dart';
@@ -71,6 +72,7 @@ class _MainShellState extends State<MainShell> {
   late final UploadScheduler _scheduler;
   late final TelegramService _telegramService;
   late final FolderStore _folderStore;
+  late final MasterSync _masterSync;
   bool _initialized = false;
   final PageController _pageCtrl = PageController();
 
@@ -81,6 +83,7 @@ class _MainShellState extends State<MainShell> {
     _scheduler = UploadScheduler();
     _telegramService = TelegramService(apiId: telegramApiId, apiHash: telegramApiHash);
     _folderStore = FolderStore();
+    _masterSync = MasterSync(scheduler: _scheduler, accounts: _accountManager);
     _init();
   }
 
@@ -95,10 +98,25 @@ class _MainShellState extends State<MainShell> {
     try {
       await _folderStore.load();
     } catch (_) {}
+    // Master sync starts its own scan when it was left on, which is what
+    // keeps a week-old gallery from needing a manual queue-up.
+    try {
+      await _masterSync.init();
+    } catch (_) {}
+    // The signed-in Telegram number scopes the statistics, and it is known
+    // from storage before the Telegram page is ever opened. Uploads from
+    // before the app recorded an account join whichever number is signed in
+    // now — this device only holds one session at a time.
+    try {
+      await _telegramService.loadAccountKey();
+      final tgKey = _telegramService.accountKey;
+      if (tgKey != null) _scheduler.attributeLegacyTelegramJobs(tgKey);
+    } catch (_) {}
     // Telegram session restore is handled by TelegramPage's _checkAuth()
     _accountManager.addListener(_onAccountChanged);
     _scheduler.addListener(_onSchedulerChanged);
     _folderStore.addListener(_onFoldersChanged);
+    _telegramService.addListener(_onTelegramChanged);
     if (mounted) setState(() => _initialized = true);
   }
 
@@ -114,11 +132,25 @@ class _MainShellState extends State<MainShell> {
     if (mounted) setState(() {});
   }
 
+  /// A sign-in (or a restore that only just finished resolving who it is)
+  /// may be the first time this launch knows the Telegram account, which is
+  /// when any unattributed uploads get pinned to it.
+  void _onTelegramChanged() {
+    final key = _telegramService.accountKey;
+    if (key != null && key.isNotEmpty) {
+      _scheduler.attributeLegacyTelegramJobs(key);
+    }
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
     _accountManager.removeListener(_onAccountChanged);
     _scheduler.removeListener(_onSchedulerChanged);
     _folderStore.removeListener(_onFoldersChanged);
+    _telegramService.removeListener(_onTelegramChanged);
+    // Master sync's periodic timer must stop before the scheduler it feeds.
+    _masterSync.dispose();
     _scheduler.dispose();
     _telegramService.dispose();
     _folderStore.dispose();
@@ -274,6 +306,8 @@ class _MainShellState extends State<MainShell> {
       StatsPage(
         scheduler: _scheduler,
         accountManager: _accountManager,
+        masterSync: _masterSync,
+        telegramService: _telegramService,
         onSignOut: () async {
           await _accountManager.signOut();
           if (!mounted) return;
@@ -349,7 +383,8 @@ class _MainShellState extends State<MainShell> {
 
           const Divider(color: Colors.grey, height: 1),
 
-          // Today's count
+          // Today's count — for the selected channel, since that is whose
+          // 15-a-day budget the number is out of.
           ListTile(
             leading: const Icon(Icons.today),
             title: const Text("Today's Uploads"),
@@ -357,13 +392,13 @@ class _MainShellState extends State<MainShell> {
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
               decoration: BoxDecoration(color: Colors.green, borderRadius: BorderRadius.circular(12)),
               child: Text(
-                '${_scheduler.todayYoutubeUploadedCount}',
+                '${_scheduler.todayYoutubeCountForChannel(_accountManager.selectedChannelId)}',
                 style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
               ),
             ),
           ),
 
-          // Total uploads
+          // Total uploads for the signed-in account
           ListTile(
             leading: const Icon(Icons.cloud_upload),
             title: const Text('Total Uploads'),
@@ -371,7 +406,7 @@ class _MainShellState extends State<MainShell> {
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
               decoration: BoxDecoration(color: Colors.blueGrey, borderRadius: BorderRadius.circular(12)),
               child: Text(
-                '${_scheduler.completedCount}',
+                '${_scheduler.completedCountForAccount(_accountManager.currentAccount?.email)}',
                 style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
               ),
             ),

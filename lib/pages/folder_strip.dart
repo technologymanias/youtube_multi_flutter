@@ -14,6 +14,7 @@ class FolderStrip extends StatelessWidget {
     required this.scope,
     required this.selectedId,
     required this.onSelected,
+    this.onUploadFolder,
   });
 
   final FolderStore store;
@@ -22,6 +23,12 @@ class FolderStrip extends StatelessWidget {
   /// Currently filtered folder, or `null` for "show everything".
   final String? selectedId;
   final ValueChanged<String?> onSelected;
+
+  /// Long-press → "Upload folder": queue the whole folder through the app's
+  /// default destination. Only the Local page supplies it — the Telegram and
+  /// YouTube grids show what is already on those services, so there is
+  /// nothing there to queue.
+  final Future<void> Function(MediaFolder folder)? onUploadFolder;
 
   @override
   Widget build(BuildContext context) {
@@ -205,6 +212,18 @@ class FolderStrip extends StatelessWidget {
                   style: TextStyle(color: Colors.grey[400], fontSize: 12)),
             ),
             const Divider(color: Colors.grey, height: 1),
+            if (onUploadFolder != null)
+              ListTile(
+                leading: const Icon(Icons.cloud_upload_outlined,
+                    color: Colors.white70),
+                title: const Text('Upload this folder',
+                    style: TextStyle(color: Colors.white)),
+                subtitle: Text(
+                    'Sends all ${folder.count} items to your default destination',
+                    style:
+                        TextStyle(color: Colors.grey[400], fontSize: 12)),
+                onTap: () => Navigator.pop(ctx, 'upload'),
+              ),
             ListTile(
               leading: const Icon(Icons.edit, color: Colors.white70),
               title: const Text('Rename',
@@ -229,6 +248,8 @@ class FolderStrip extends StatelessWidget {
     );
     if (!context.mounted || action == null) return;
     switch (action) {
+      case 'upload':
+        await onUploadFolder?.call(folder);
       case 'rename':
         await _renameFolder(context, folder);
       case 'color':
@@ -411,6 +432,94 @@ class FolderStrip extends StatelessWidget {
     onSelected(folder.id);
   }
 }
+
+/// Chips naming the folders an item has been filed into, drawn on top of a
+/// grid tile so something that was moved into a folder is visibly filed
+/// instead of silently missing from the main view.
+///
+/// Empty when the item is in no folder, which costs the caller nothing extra
+/// than a zero-height box.
+class FolderTags extends StatelessWidget {
+  const FolderTags({
+    super.key,
+    required this.store,
+    required this.scope,
+    required this.itemId,
+    this.max = 2,
+  });
+
+  final FolderStore store;
+  final FolderScope scope;
+  final String itemId;
+
+  /// How many folder names to print before collapsing the rest into "+n" —
+  /// a tile in eight folders must still read as one tile.
+  final int max;
+
+  @override
+  Widget build(BuildContext context) {
+    final folders = store.containing(scope, itemId);
+    if (folders.isEmpty) return const SizedBox.shrink();
+    final shown = folders.take(max).toList();
+    final extra = folders.length - shown.length;
+    // Wrap rather than Row: a narrow tile must fold a second chip onto its
+    // own line instead of spilling out of the caption box.
+    return Wrap(
+      spacing: 4,
+      runSpacing: 2,
+      children: [
+        for (final folder in shown) _tag(folder),
+        if (extra > 0) _moreTag(extra),
+      ],
+    );
+  }
+
+  Widget _tag(MediaFolder folder) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+        decoration: BoxDecoration(
+          color: Color(folderColorAt(folder.colorIndex)).withValues(alpha: 0.92),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.folder_rounded, size: 9, color: Colors.white),
+            const SizedBox(width: 3),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 70),
+              child: Text(
+                folder.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w700),
+              ),
+            ),
+          ],
+        ),
+      );
+
+  Widget _moreTag(int extra) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.6),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Text(
+          '+$extra',
+          style: const TextStyle(
+              color: Colors.white70, fontSize: 9, fontWeight: FontWeight.w700),
+        ),
+      );
+}
+
+/// Whether [itemId] is filed anywhere in [scope]. Lets a caption layout keep
+/// its tight spacing instead of always reserving a gap for chips that are
+/// usually not there.
+bool hasFolderTags(FolderStore store, FolderScope scope, String itemId) =>
+    store.containing(scope, itemId).isNotEmpty;
 
 /// Bottom sheet listing every folder on a page, used from the app bar as the
 /// non-drag path into the same place.

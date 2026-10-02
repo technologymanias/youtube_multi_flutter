@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 class ChannelInfo {
   final String id;
@@ -24,6 +25,11 @@ class ChannelInfo {
 }
 
 class AccountManager extends ChangeNotifier {
+  /// The channel picked by hand, remembered so per-channel statistics keep
+  /// pointing at the same channel after a restart instead of quietly
+  /// moving to whatever the account lists first.
+  static const String _selectedChannelKey = 'selected_channel_id';
+
   final GoogleSignIn _googleSignIn;
 
   GoogleSignInAccount? _currentAccount;
@@ -116,7 +122,7 @@ class AccountManager extends ChangeNotifier {
         )).toList() ?? [];
 
         if (_channels.isNotEmpty && _selectedChannel == null) {
-          _selectedChannel = _channels.first;
+          await _restoreSelectedChannel();
         }
         notifyListeners();
       }
@@ -125,8 +131,33 @@ class AccountManager extends ChangeNotifier {
     }
   }
 
-  void selectChannel(ChannelInfo channel) {
+  /// Picks the remembered channel when this account still has it, and falls
+  /// back to the first one otherwise — an id saved for another account can
+  /// never select a channel that is not on screen.
+  Future<void> _restoreSelectedChannel() async {
+    String? saved;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      saved = prefs.getString(_selectedChannelKey);
+    } catch (e) {
+      debugPrint('Could not read selected channel: $e');
+    }
+    if (_channels.isEmpty) return;
+    _selectedChannel = saved == null
+        ? null
+        : _channels.where((c) => c.id == saved).firstOrNull;
+    _selectedChannel ??= _channels.first;
+  }
+
+  Future<void> selectChannel(ChannelInfo channel) async {
     _selectedChannel = channel;
     notifyListeners();
+    // Statistics are per channel, so the choice has to outlive the app.
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_selectedChannelKey, channel.id);
+    } catch (e) {
+      debugPrint('Could not persist selected channel: $e');
+    }
   }
 }

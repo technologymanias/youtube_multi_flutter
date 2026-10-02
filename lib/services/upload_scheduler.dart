@@ -27,6 +27,11 @@ class UploadJob {
   UploadDestination destination;
   String? folder;
 
+  /// The Telegram account the copy was sent to, recorded when the upload
+  /// finished — "Telegram today" is that account's number, so signing into
+  /// a different phone number shows that number's uploads instead.
+  String telegramAccountId;
+
   UploadJob({
     required this.id,
     required this.assetId,
@@ -44,6 +49,7 @@ class UploadJob {
     this.accountEmail = '',
     this.destination = UploadDestination.youtube,
     this.folder,
+    this.telegramAccountId = '',
   });
 
   Map<String, dynamic> toJson() => {
@@ -63,6 +69,7 @@ class UploadJob {
     'accountEmail': accountEmail,
     'destination': destination.index,
     'folder': folder,
+    'telegramAccountId': telegramAccountId,
   };
 
   factory UploadJob.fromJson(Map<String, dynamic> json) => UploadJob(
@@ -84,6 +91,7 @@ class UploadJob {
         ? UploadDestination.values[json['destination'] as int]
         : UploadDestination.youtube,
     folder: json['folder'] as String?,
+    telegramAccountId: json['telegramAccountId'] as String? ?? '',
   );
 
   String get displayName =>
@@ -101,6 +109,22 @@ class UploadScheduler extends ChangeNotifier {
   List<UploadJob> _jobs = [];
   DateTime _lastUiNotify = DateTime.fromMillisecondsSinceEpoch(0);
 
+  /// When the whole queue is paused, [claimNext] hands out nothing: the page
+  /// keeps showing every job exactly as it was, but no new upload starts
+  /// until it is resumed. An upload already in flight runs to completion —
+  /// aborting mid-file would only throw away the bytes already sent.
+  bool _paused = false;
+
+  bool get paused => _paused;
+
+  Future<void> setPaused(bool value) async {
+    if (_paused == value) return;
+    _paused = value;
+    await _save();
+    notifyListeners();
+    debugPrint('[Queue] ${value ? "paused" : "resumed"}');
+  }
+
   /// Progress/status updates fire for every upload chunk; notifying the UI on
   /// each one saturates the main isolate, so these are rate-limited.
   void _notifyThrottled({int minIntervalMs = 300}) {
@@ -116,10 +140,19 @@ class UploadScheduler extends ChangeNotifier {
   /// badge back just because the answer lived only in memory.
   final Set<String> _deletedTelegramJobIds = {};
 
+  /// Same story as [_deletedTelegramJobIds], for copies deleted on YouTube.
+  final Set<String> _deletedYoutubeJobIds = {};
+
   /// Whether the job's Telegram copy is still believed to exist. The TG badge
   /// is only shown while this is true.
   bool isOnTelegram(UploadJob job) =>
       job.uploadedToTelegram && !_deletedTelegramJobIds.contains(job.id);
+
+  /// Whether the job's YouTube copy is still believed to exist. Mirrors
+  /// [isOnTelegram] so the YT badge reflects what is really on the channel
+  /// instead of what was true when the upload finished.
+  bool isOnYoutube(UploadJob job) =>
+      job.uploadedToYoutube && !_deletedYoutubeJobIds.contains(job.id);
 
   /// Applies one round of verification against Telegram. [present] re-enables
   /// the badge, [absent] clears it, and anything in neither list keeps
@@ -127,28 +160,51 @@ class UploadScheduler extends ChangeNotifier {
   /// restore a badge the user already saw disappear.
   void applyTelegramVerdict(
       {required Set<String> present, required Set<String> absent}) {
-    var changed = false;
-    for (final id in present) {
-      if (_deletedTelegramJobIds.remove(id)) changed = true;
-    }
-    for (final id in absent) {
-      if (_deletedTelegramJobIds.add(id)) changed = true;
-    }
-    if (!changed) return;
-    _persistDeletedTelegram();
-    notifyListeners();
-  }
-
-  void clearDeletedOnTelegram(String jobId) {
-    if (_deletedTelegramJobIds.remove(jobId)) {
-      _persistDeletedTelegram();
+    if (_applyVerdict(_deletedTelegramJobIds, present: present, absent: absent)) {
+      _persistVerdicts();
       notifyListeners();
     }
   }
 
-  /// The deleted-set rides in the same secure-storage blob as the jobs, so it
-  /// is written through [_save] rather than a key of its own.
-  void _persistDeletedTelegram() {
+  /// One round of verification against YouTube, with the same contract as
+  /// [applyTelegramVerdict].
+  void applyYoutubeVerdict(
+      {required Set<String> present, required Set<String> absent}) {
+    if (_applyVerdict(_deletedYoutubeJobIds, present: present, absent: absent)) {
+      _persistVerdicts();
+      notifyListeners();
+    }
+  }
+
+  bool _applyVerdict(Set<String> store,
+      {required Set<String> present, required Set<String> absent}) {
+    var changed = false;
+    for (final id in present) {
+      if (store.remove(id)) changed = true;
+    }
+    for (final id in absent) {
+      if (store.add(id)) changed = true;
+    }
+    return changed;
+  }
+
+  void clearDeletedOnTelegram(String jobId) {
+    if (_deletedTelegramJobIds.remove(jobId)) {
+      _persistVerdicts();
+      notifyListeners();
+    }
+  }
+
+  void clearDeletedOnYoutube(String jobId) {
+    if (_deletedYoutubeJobIds.remove(jobId)) {
+      _persistVerdicts();
+      notifyListeners();
+    }
+  }
+
+  /// The verdicts ride in the same secure-storage blob as the jobs, so they
+  /// are written through [_save] rather than a key of their own.
+  void _persistVerdicts() {
     unawaited(_save());
   }
 
@@ -160,35 +216,103 @@ class UploadScheduler extends ChangeNotifier {
   int get completedCount => _jobs.where((j) => j.status == JobStatus.completed).length;
   int get failedCount => _jobs.where((j) => j.status == JobStatus.failed).length;
 
-  int get todayYoutubeUploadedCount {
-    final today = DateTime.now().toIso8601String().substring(0, 10);
-    return _jobs.where((j) =>
+  /// Whether [job] counts for [channelId]'s numbers. Jobs queued before the
+  /// app recorded a channel carry no id and stay visible for every channel —
+  /// they are this device's own history, not another channel's.
+  static bool belongsToChannel(UploadJob job, String? channelId) =>
+      channelId == null ||
+      channelId.isEmpty ||
+      job.channelId.isEmpty ||
+      job.channelId == channelId;
+
+  /// Whether [job] counts for the Google account [accountEmail]: the same
+  /// "no id recorded, so it belongs to whoever is signed in" rule as
+  /// [belongsToChannel], for accounts instead of channels.
+  static bool belongsToAccount(UploadJob job, String? accountEmail) =>
+      accountEmail == null ||
+      accountEmail.isEmpty ||
+      job.accountEmail.isEmpty ||
+      job.accountEmail == accountEmail;
+
+  /// Whether [job] counts for the Telegram account [accountId]. Same rule
+  /// again: uploads finished before the app recorded which phone number
+  /// they went to belong to every account until they are attributed.
+  static bool belongsToTelegramAccount(UploadJob job, String? accountId) =>
+      accountId == null ||
+      accountId.isEmpty ||
+      job.telegramAccountId.isEmpty ||
+      job.telegramAccountId == accountId;
+
+  bool _completedOn(UploadJob j, String today) =>
       j.status == JobStatus.completed &&
       j.completedAt != null &&
-      j.completedAt!.toIso8601String().substring(0, 10) == today &&
-      j.destination == UploadDestination.youtube
-    ).length;
+      j.completedAt!.toIso8601String().substring(0, 10) == today;
+
+  /// Today's YouTube uploads for one channel — the number the 15-a-day ring
+  /// is out of. A `both` job counts here (it did use a YouTube slot), which
+  /// is the same arithmetic [_youtubeDateCounts] spends the quota with.
+  int todayYoutubeCountForChannel(String? channelId) {
+    final today = DateTime.now().toIso8601String().substring(0, 10);
+    return _jobs
+        .where((j) =>
+            _completedOn(j, today) &&
+            j.uploadedToYoutube &&
+            belongsToChannel(j, channelId))
+        .length;
   }
 
-  int get todayTelegramUploadedCount {
+  /// Today's Telegram uploads for one account, so signing into a different
+  /// phone number shows that number's uploads. Null means "no account
+  /// known" and falls back to the whole device's count.
+  int todayTelegramCountForAccount(String? accountId) {
     final today = DateTime.now().toIso8601String().substring(0, 10);
-    return _jobs.where((j) =>
-      j.status == JobStatus.completed &&
-      j.completedAt != null &&
-      j.completedAt!.toIso8601String().substring(0, 10) == today &&
-      j.destination == UploadDestination.telegram
-    ).length;
+    return _jobs
+        .where((j) =>
+            _completedOn(j, today) &&
+            j.uploadedToTelegram &&
+            belongsToTelegramAccount(j, accountId))
+        .length;
   }
 
-  int todayYoutubeUploadedCountForChannel(String channelId) {
-    final today = DateTime.now().toIso8601String().substring(0, 10);
-    return _jobs.where((j) =>
-      j.channelId == channelId &&
-      j.status == JobStatus.completed &&
-      j.completedAt != null &&
-      j.completedAt!.toIso8601String().substring(0, 10) == today &&
-      j.destination == UploadDestination.youtube
-    ).length;
+  /// Completed uploads belonging to one Google account.
+  int completedCountForAccount(String? accountEmail) => _jobs
+      .where((j) =>
+          j.status == JobStatus.completed &&
+          belongsToAccount(j, accountEmail))
+      .length;
+
+  /// Failed jobs belonging to one Google account.
+  int failedCountForAccount(String? accountEmail) => _jobs
+      .where((j) =>
+          j.status == JobStatus.failed && belongsToAccount(j, accountEmail))
+      .length;
+
+  /// Work still waiting (pending, uploading or scheduled) for one account.
+  int queuedCountForAccount(String? accountEmail) => _jobs
+      .where((j) =>
+          (j.status == JobStatus.pending ||
+              j.status == JobStatus.uploading ||
+              j.status == JobStatus.scheduled) &&
+          belongsToAccount(j, accountEmail))
+      .length;
+
+  /// Credits Telegram uploads finished before the app recorded which
+  /// account they went to. They were sent by whatever account is signed in
+  /// now — this device has only ever held one session at a time — so they
+  /// join that account's numbers instead of floating across every future
+  /// login. Jobs that already know their account are never re-stamped.
+  void attributeLegacyTelegramJobs(String accountId) {
+    if (accountId.isEmpty) return;
+    var changed = false;
+    for (final j in _jobs) {
+      if (j.uploadedToTelegram && j.telegramAccountId.isEmpty) {
+        j.telegramAccountId = accountId;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    unawaited(_save());
+    notifyListeners();
   }
 
   List<UploadJob> get pendingAndActive =>
@@ -222,15 +346,22 @@ class UploadScheduler extends ChangeNotifier {
         for (final e in (decoded['jobs'] as List?) ?? const [])
           UploadJob.fromJson(e as Map<String, dynamic>),
       ];
+      _paused = decoded['paused'] as bool? ?? false;
       _deletedTelegramJobIds
         ..clear()
         ..addAll(
             ((decoded['deletedTelegram'] as List?) ?? const [])
                 .map((e) => '$e'));
+      _deletedYoutubeJobIds
+        ..clear()
+        ..addAll(
+            ((decoded['deletedYoutube'] as List?) ?? const [])
+                .map((e) => '$e'));
     }
     // Ids for jobs that no longer exist would otherwise linger forever.
     final known = {for (final j in _jobs) j.id};
     _deletedTelegramJobIds.removeWhere((id) => !known.contains(id));
+    _deletedYoutubeJobIds.removeWhere((id) => !known.contains(id));
     _rescheduleAfterRestart();
     notifyListeners();
   }
@@ -239,29 +370,104 @@ class UploadScheduler extends ChangeNotifier {
     final data = jsonEncode(<String, dynamic>{
       'jobs': _jobs.map((j) => j.toJson()).toList(),
       'deletedTelegram': _deletedTelegramJobIds.toList(),
+      'deletedYoutube': _deletedYoutubeJobIds.toList(),
+      'paused': _paused,
     });
     await _storage.write(key: _storageKey, value: data);
     unawaited(updateBadgeCount(pendingCount + uploadingCount));
   }
 
   void _rescheduleAfterRestart() {
-    final now = DateTime.now();
     for (final job in _jobs) {
       if (job.status == JobStatus.uploading) {
         job.status = JobStatus.pending;
         job.progress = 0;
       }
-      // Convert scheduled jobs whose date has arrived to pending
-      if (job.status == JobStatus.scheduled &&
-          job.scheduledDate != null &&
-          !job.scheduledDate!.isAfter(now)) {
-        job.status = JobStatus.pending;
-        job.scheduledDate = null;
-      }
     }
+    // Whose day has arrived is decided by the same quota-aware promotion the
+    // live tick uses, so reopening the app after a week away cannot pull four
+    // days of YouTube uploads into one morning.
+    promoteDueScheduled();
   }
 
-  Future<void> addJobs(List<Map<String, String>> videos, String channelId, String accountEmail, {UploadDestination destination = UploadDestination.youtube}) async {
+  /// How many of [channelId]'s YouTube slots are already spoken for on each
+  /// date: completed uploads sit on the date they finished, scheduled work on
+  /// the date it is waiting for, and undated pending work against today.
+  ///
+  /// This is the same arithmetic [addJobs] uses to decide whether a new video
+  /// still fits on a day, so promotion and scheduling can never disagree
+  /// about how full today is.
+  Map<String, int> _youtubeDateCounts(String channelId, String todayKey) {
+    final counts = <String, int>{};
+    for (final j in _jobs) {
+      if (j.channelId != channelId || !j.uploadedToYoutube) continue;
+      String dateKey;
+      if (j.status == JobStatus.completed && j.completedAt != null) {
+        dateKey = j.completedAt!.toIso8601String().substring(0, 10);
+      } else if (j.status == JobStatus.scheduled && j.scheduledDate != null) {
+        dateKey = j.scheduledDate!.toIso8601String().substring(0, 10);
+      } else if (j.status == JobStatus.pending ||
+          j.status == JobStatus.uploading) {
+        dateKey = todayKey;
+      } else {
+        continue;
+      }
+      counts[dateKey] = (counts[dateKey] ?? 0) + 1;
+    }
+    return counts;
+  }
+
+  /// Turns scheduled jobs whose day has arrived into runnable ones, and
+  /// returns whether anything changed.
+  ///
+  /// [_rescheduleAfterRestart] only runs while the app is loading, so a queue
+  /// left open across midnight would otherwise sit on its schedule forever.
+  /// YouTube jobs are only promoted while that day still has slots: a queue
+  /// that was closed for a week must not dump four days of uploads into one
+  /// morning — the plan keeps rolling 15 onto the next day instead. Telegram
+  /// has no daily cap, so those promote as soon as they are due.
+  bool promoteDueScheduled() {
+    final now = DateTime.now();
+    final todayKey = now.toIso8601String().substring(0, 10);
+    final slotsLeft = <String, int>{};
+    var changed = false;
+
+    final due = _jobs
+        .where((j) =>
+            j.status == JobStatus.scheduled &&
+            j.scheduledDate != null &&
+            !j.scheduledDate!.isAfter(now))
+        .toList()
+      ..sort((a, b) =>
+          a.scheduledDate!.compareTo(b.scheduledDate!));
+
+    for (final job in due) {
+      if (job.uploadedToYoutube) {
+        final left = slotsLeft.putIfAbsent(
+          job.channelId,
+          () => youtubeDailyLimit -
+              (_youtubeDateCounts(job.channelId, todayKey)[todayKey] ?? 0),
+        );
+        if (left <= 0) continue;
+        slotsLeft[job.channelId] = left - 1;
+      }
+      job.status = JobStatus.pending;
+      job.scheduledDate = null;
+      changed = true;
+    }
+
+    if (changed) {
+      unawaited(_save());
+      notifyListeners();
+    }
+    return changed;
+  }
+
+  /// [folder] tags every created job with the local folder it came from: it
+  /// drives the Telegram `#folder` caption, the YouTube playlist the upload
+  /// lands in, and the queue row's own label. Nullable so gallery picks —
+  /// which are not filed anywhere — stay untagged.
+  Future<void> addJobs(List<Map<String, String>> videos, String channelId, String accountEmail, {UploadDestination destination = UploadDestination.youtube, String? folder}) async {
     final today = DateTime.now();
 
     if (destination == UploadDestination.telegram) {
@@ -274,27 +480,17 @@ class UploadScheduler extends ChangeNotifier {
           channelId: channelId,
           accountEmail: accountEmail,
           destination: destination,
+          folder: folder,
         );
         _jobs.add(job);
       }
     } else {
       final todayStr = today.toIso8601String().substring(0, 10);
 
-      // Count YouTube jobs already assigned to each date for this channel
-      final dateCounts = <String, int>{};
-      for (final j in _jobs.where((j) => j.channelId == channelId && j.destination == UploadDestination.youtube)) {
-        String dateKey;
-        if (j.status == JobStatus.completed && j.completedAt != null) {
-          dateKey = j.completedAt!.toIso8601String().substring(0, 10);
-        } else if (j.status == JobStatus.scheduled && j.scheduledDate != null) {
-          dateKey = j.scheduledDate!.toIso8601String().substring(0, 10);
-        } else if (j.status == JobStatus.pending && j.scheduledDate == null) {
-          dateKey = todayStr;
-        } else {
-          continue;
-        }
-        dateCounts[dateKey] = (dateCounts[dateKey] ?? 0) + 1;
-      }
+      // Count YouTube jobs already assigned to each date for this channel.
+      // Shared with promoteDueScheduled() so adding and rolling the queue
+      // forward always read the same "how full is this day" answer.
+      final dateCounts = _youtubeDateCounts(channelId, todayStr);
 
       int dayOffset = 0;
       for (final video in videos) {
@@ -316,6 +512,7 @@ class UploadScheduler extends ChangeNotifier {
           channelId: channelId,
           accountEmail: accountEmail,
           destination: destination,
+          folder: folder,
         );
 
         if (dayOffset > 0) {
@@ -331,6 +528,9 @@ class UploadScheduler extends ChangeNotifier {
   }
 
   UploadJob? claimNext() {
+    // A paused queue claims nothing — this is the single gate every upload
+    // path goes through, so pausing here stops the whole queue at once.
+    if (_paused) return null;
     // Get the first pending job that is scheduled for today or earlier
     final now = DateTime.now();
     final idx = _jobs.indexWhere((j) =>
@@ -359,13 +559,16 @@ class UploadScheduler extends ChangeNotifier {
     _notifyThrottled();
   }
 
-  Future<void> markCompleted(String id, {String youtubeVideoId = '', String telegramMessageId = ''}) async {
+  Future<void> markCompleted(String id, {String youtubeVideoId = '', String telegramMessageId = '', String? telegramAccountId}) async {
     final idx = _jobs.indexWhere((j) => j.id == id);
     if (idx == -1) return;
     _jobs[idx].status = JobStatus.completed;
     _jobs[idx].progress = 1.0;
     if (youtubeVideoId.isNotEmpty) _jobs[idx].youtubeVideoId = youtubeVideoId;
     if (telegramMessageId.isNotEmpty) _jobs[idx].telegramMessageId = telegramMessageId;
+    if (telegramAccountId != null && telegramAccountId.isNotEmpty) {
+      _jobs[idx].telegramAccountId = telegramAccountId;
+    }
     _jobs[idx].completedAt = DateTime.now();
     await _save();
     notifyListeners();
@@ -466,25 +669,15 @@ class UploadScheduler extends ChangeNotifier {
       _jobs.where((j) => j.status == JobStatus.completed && j.uploadedToTelegram).toList()
         ..sort((a, b) => (b.completedAt ?? DateTime(0)).compareTo(a.completedAt ?? DateTime(0)));
 
-  int get todayYoutubeCount {
-    final today = DateTime.now().toIso8601String().substring(0, 10);
-    return _jobs.where((j) =>
-      j.status == JobStatus.completed &&
-      j.completedAt != null &&
-      j.completedAt!.toIso8601String().substring(0, 10) == today &&
-      j.uploadedToYoutube
-    ).length;
-  }
+  /// Today's YouTube uploads across every channel. Prefer
+  /// [todayYoutubeCountForChannel] wherever a channel is selected — the
+  /// 15-a-day budget is per channel, so a total is only the right number
+  /// when no channel is in view.
+  int get todayYoutubeCount => todayYoutubeCountForChannel(null);
 
-  int get todayTelegramCount {
-    final today = DateTime.now().toIso8601String().substring(0, 10);
-    return _jobs.where((j) =>
-      j.status == JobStatus.completed &&
-      j.completedAt != null &&
-      j.completedAt!.toIso8601String().substring(0, 10) == today &&
-      j.uploadedToTelegram
-    ).length;
-  }
+  /// Today's Telegram uploads across every account on this device; see
+  /// [todayTelegramCountForAccount] for the per-account number.
+  int get todayTelegramCount => todayTelegramCountForAccount(null);
 
   List<String> get folders =>
       _jobs.map((j) => j.folder).whereType<String>().where((f) => f.isNotEmpty).toSet().toList()..sort();

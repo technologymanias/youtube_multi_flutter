@@ -3,15 +3,26 @@ import 'package:intl/intl.dart';
 
 import '../services/upload_scheduler.dart';
 import '../services/account_manager.dart';
+import '../services/master_sync.dart';
+import '../services/telegram_service.dart';
 
 enum _ChartRange { week, month, year }
 
 class StatsPage extends StatefulWidget {
   final UploadScheduler scheduler;
   final AccountManager accountManager;
+  final MasterSync? masterSync;
+  final TelegramService? telegramService;
   final VoidCallback? onSignOut;
 
-  const StatsPage({Key? key, required this.scheduler, required this.accountManager, this.onSignOut}) : super(key: key);
+  const StatsPage({
+    Key? key,
+    required this.scheduler,
+    required this.accountManager,
+    this.masterSync,
+    this.telegramService,
+    this.onSignOut,
+  }) : super(key: key);
 
   @override
   State<StatsPage> createState() => _StatsPageState();
@@ -24,6 +35,27 @@ class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixi
   int _recentPage = 0;
   int _historyFilter = 0;
   static const int _pageSize = 10;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.masterSync?.addListener(_onDataChanged);
+    // The Telegram account is resolved asynchronously (and again whenever
+    // someone signs into a different number), so this page has to follow it
+    // to keep "Telegram today" showing the right account's uploads.
+    widget.telegramService?.addListener(_onDataChanged);
+  }
+
+  @override
+  void dispose() {
+    widget.masterSync?.removeListener(_onDataChanged);
+    widget.telegramService?.removeListener(_onDataChanged);
+    super.dispose();
+  }
+
+  void _onDataChanged() {
+    if (mounted) setState(() {});
+  }
 
   void _showChannelPicker(BuildContext context) {
     showModalBottomSheet(
@@ -98,23 +130,290 @@ class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixi
     return c?.title ?? channelId;
   }
 
+  /// The app-wide switch that keeps every un-sent video and photo moving.
+  /// Shown as an explicit ON/OFF rather than a bare toggle so the state is
+  /// readable at a glance, with what it will do spelled out underneath — the
+  /// behaviour (15 a day on YouTube, no cap on Telegram) is not something a
+  /// switch can explain by itself.
+  Widget _buildMasterSyncCard() {
+    final sync = widget.masterSync;
+    if (sync == null) return const SizedBox.shrink();
+    final on = sync.enabled;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.grey[900],
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: on ? Colors.green.withValues(alpha: 0.5) : Colors.grey[800]!,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.sync,
+                  size: 20, color: on ? Colors.green : Colors.grey[600]),
+              const SizedBox(width: 8),
+              Text('Master Sync',
+                  style: TextStyle(
+                      color: Colors.grey[300],
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600)),
+              const Spacer(),
+              Text(on ? 'ON' : 'OFF',
+                  style: TextStyle(
+                      color: on ? Colors.green : Colors.grey[500],
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold)),
+              const SizedBox(width: 4),
+              Switch(
+                value: on,
+                activeThumbColor: Colors.green,
+                // Never disabled: a pass can run for minutes, and a switch
+                // that refuses to move is a switch whose state the app then
+                // restarts with. Turning it off mid-pass is supported — the
+                // pass checks the flag between steps.
+                onChanged: sync.setEnabled,
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'While on, every category switched on below is queued '
+            'automatically. Videos go to YouTube (15 a day, the rest '
+            'rolls onto the next days) and to Telegram (no daily limit); '
+            'photos and files go to Telegram.',
+            style: TextStyle(color: Colors.grey[600], fontSize: 11),
+          ),
+          if (on) ...[
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                if (sync.running) ...[
+                  const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Colors.green),
+                  ),
+                  const SizedBox(width: 8),
+                  Text('Syncing…',
+                      style:
+                          TextStyle(color: Colors.grey[400], fontSize: 12)),
+                ] else ...[
+                  Icon(Icons.history, size: 14, color: Colors.grey[600]),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      sync.lastRun == null
+                          ? 'Not synced yet'
+                          : 'Last sync ${DateFormat('MMM d, HH:mm').format(sync.lastRun!)}',
+                      style:
+                          TextStyle(color: Colors.grey[500], fontSize: 12),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            if (sync.lastError != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(sync.lastError!,
+                    style: TextStyle(color: Colors.red[300], fontSize: 11)),
+              )
+            else if (sync.lastYoutubeAdded > 0 ||
+                sync.lastTelegramAdded > 0)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  'Last pass queued ${sync.lastYoutubeAdded} for YouTube '
+                  'and ${sync.lastTelegramAdded} for Telegram',
+                  style:
+                      TextStyle(color: Colors.grey[500], fontSize: 11),
+                ),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// One on/off toggle per category — Telegram videos, Telegram photos,
+  /// Telegram files and YouTube videos — because "has this gone up?" is
+  /// always asked about one destination at a time.
+  ///
+  /// A category that is on is queued automatically by the master pass, and
+  /// switching it on also runs that category straight away so the press has
+  /// an immediate answer instead of waiting for the next tick. The line
+  /// underneath reports what the last run actually did rather than leaving
+  /// the user to guess whether anything happened.
+  Widget _buildCategorySyncCard() {
+    final sync = widget.masterSync;
+    if (sync == null) return const SizedBox.shrink();
+
+    final target = sync.lastSyncedTarget;
+    final result = target == null ? null : sync.lastResultFor(target);
+    final at = target == null ? null : sync.lastRunFor(target);
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.grey[900],
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.grey[800]!),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.playlist_add, size: 20, color: Colors.grey[400]),
+              const SizedBox(width: 8),
+              Text('Sync categories',
+                  style: TextStyle(
+                      color: Colors.grey[300],
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600)),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Turn a category on to queue everything not uploaded to that '
+            'destination yet, oldest first. YouTube takes 15 a day and the '
+            'rest is scheduled onto the following days; Telegram has no '
+            'daily limit.',
+            style: TextStyle(color: Colors.grey[600], fontSize: 11),
+          ),
+          const SizedBox(height: 12),
+          _syncToggle(sync, SyncTarget.telegramVideos, Icons.videocam,
+              Colors.blue),
+          _syncToggle(sync, SyncTarget.telegramPhotos, Icons.image,
+              Colors.blue),
+          _syncToggle(sync, SyncTarget.telegramFiles,
+              Icons.insert_drive_file, Colors.blue),
+          _syncToggle(sync, SyncTarget.youtubeVideos, Icons.ondemand_video,
+              Colors.red),
+          if (result != null && target != null && at != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 10),
+              child: Text(
+                _syncStatusLine(target, result, at),
+                style: TextStyle(
+                    color: result.ok ? Colors.grey[500] : Colors.red[300],
+                    fontSize: 11),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  String _syncStatusLine(
+      SyncTarget target, MasterSyncResult result, DateTime at) {
+    final time = DateFormat('MMM d, HH:mm').format(at);
+    if (!result.ok) {
+      return '${target.label}: ${result.error} ($time)';
+    }
+    if (result.added == 0) {
+      return result.skipped == 0
+          ? '${target.label}: nothing to queue ($time)'
+          : '${target.label}: all ${result.skipped} already uploaded ($time)';
+    }
+    return '${target.label}: queued ${result.added}'
+        '${result.skipped > 0 ? ', ${result.skipped} already uploaded' : ''}'
+        ' ($time)';
+  }
+
+  /// One row of the category card: the label, an explicit ON/OFF reading and
+  /// the switch itself. Switching on kicks off that category immediately
+  /// (unless a pass is already running, which the row shows as a spinner);
+  /// switching off simply means the next automatic pass skips it.
+  Widget _syncToggle(
+      MasterSync sync, SyncTarget target, IconData icon, Color color) {
+    final on = sync.targetEnabled(target);
+    final busy = sync.runningTarget == target;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
+      decoration: BoxDecoration(
+        color: Colors.grey[850],
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(
+          color: on ? color.withValues(alpha: 0.45) : Colors.grey[800]!,
+        ),
+      ),
+      child: Row(
+        children: [
+          busy
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2))
+              : Icon(icon, size: 16, color: on ? color : Colors.grey[600]),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(target.label,
+                style: TextStyle(
+                    color: on ? Colors.grey[200] : Colors.grey[600],
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600)),
+          ),
+          Text(on ? 'ON' : 'OFF',
+              style: TextStyle(
+                  color: on ? Colors.green : Colors.grey[600],
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold)),
+          Switch(
+            value: on,
+            activeThumbColor: color,
+            materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            // Same rule as the master switch: the state is saved either
+            // way, so the toggle must work while another pass is running.
+            onChanged: (value) async {
+              await sync.setTargetEnabled(target, value);
+              // Turning a category on is the old "sync now" button:
+              // queue what is missing straight away instead of waiting
+              // for the next automatic pass. One pass at a time, though —
+              // while another is going, the next pass takes it on.
+              if (value && !sync.running) await sync.syncTarget(target);
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
     final acct = widget.accountManager.currentAccount;
     final ch = widget.accountManager.selectedChannel;
-    final completed = widget.scheduler.completedJobs;
-    final failed = widget.scheduler.failedJobs;
+    final email = acct?.email;
+    // Every number on this page answers for the account in view: the
+    // signed-in Google account owns the YouTube channels, and the
+    // signed-in Telegram number owns its own uploads. Jobs recorded before
+    // the app knew who uploaded them carry no id and stay visible for the
+    // account that is signed in now.
+    final completed = widget.scheduler.completedJobs
+        .where((j) => UploadScheduler.belongsToAccount(j, email))
+        .toList();
+    final failed = widget.scheduler.failedJobs
+        .where((j) => UploadScheduler.belongsToAccount(j, email))
+        .toList();
 
     // Compute chart stats based on selected range
     final chartData = <String, int>{};
     final today = DateTime.now();
     String label;
 
-    // Filter completed jobs by selected channel
-    final channelCompleted = ch != null
-        ? completed.where((j) => j.channelId == ch.id).toList()
-        : completed;
+    // The chart follows the selected channel — the 15-a-day budget and the
+    // history behind it are per channel, not per device.
+    final channelCompleted = completed
+        .where((j) => UploadScheduler.belongsToChannel(j, ch?.id))
+        .toList();
 
     switch (_chartRange) {
       case _ChartRange.month:
@@ -165,10 +464,10 @@ class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixi
       if (v > maxVal) maxVal = v;
     }
 
-    final ytToday = ch != null
-        ? widget.scheduler.todayYoutubeUploadedCountForChannel(ch.id)
-        : widget.scheduler.todayYoutubeCount;
-    final tgToday = widget.scheduler.todayTelegramCount;
+    final ytToday = widget.scheduler.todayYoutubeCountForChannel(ch?.id);
+    final tgToday = widget.scheduler
+        .todayTelegramCountForAccount(widget.telegramService?.accountKey);
+    final queued = widget.scheduler.queuedCountForAccount(email);
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -220,6 +519,10 @@ class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixi
             ),
           ),
           const SizedBox(height: 16),
+          _buildMasterSyncCard(),
+          const SizedBox(height: 12),
+          _buildCategorySyncCard(),
+          const SizedBox(height: 12),
           if (widget.accountManager.channels.length > 1) ...[
             SizedBox(
               width: double.infinity,
@@ -310,6 +613,13 @@ class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixi
                 ),
                 const SizedBox(height: 8),
                 Text('$tgToday', style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 4),
+                Text(
+                  widget.telegramService?.accountPhone != null
+                      ? 'account ${widget.telegramService!.accountPhone}'
+                      : 'signed-in Telegram account',
+                  style: TextStyle(color: Colors.grey[600], fontSize: 11),
+                ),
               ],
             ),
           ),
@@ -362,7 +672,7 @@ class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixi
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        '${widget.scheduler.pendingCount + widget.scheduler.uploadingCount + widget.scheduler.scheduledCount}',
+                        '$queued',
                         style: const TextStyle(color: Colors.white, fontSize: 28, fontWeight: FontWeight.bold),
                       ),
                     ],
@@ -525,11 +835,13 @@ class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixi
           ),
           const SizedBox(height: 8),
           () {
-            final all = widget.scheduler.recentJobs;
+            final all = widget.scheduler.recentJobs
+                .where((j) => UploadScheduler.belongsToAccount(j, email))
+                .toList();
             final filtered = _historyFilter == 0
                 ? all
                 : _historyFilter == 1
-                    ? all.where((j) => j.uploadedToYoutube).toList()
+                    ? all.where(widget.scheduler.isOnYoutube).toList()
                     : all.where((j) => widget.scheduler.isOnTelegram(j)).toList();
             final totalPages = filtered.isEmpty ? 1 : (filtered.length / _pageSize).ceil();
             final page = _recentPage.clamp(0, totalPages - 1);
@@ -573,7 +885,7 @@ class _StatsPageState extends State<StatsPage> with AutomaticKeepAliveClientMixi
                         children: [
                           Icon(icon, color: iconColor, size: 16),
                           const SizedBox(width: 6),
-                          if (job.uploadedToYoutube)
+                          if (widget.scheduler.isOnYoutube(job))
                             Container(
                               margin: const EdgeInsets.only(right: 3),
                               padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),

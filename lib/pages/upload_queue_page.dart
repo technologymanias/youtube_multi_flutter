@@ -10,6 +10,7 @@ import '../youtube_uploader.dart';
 import '../services/upload_scheduler.dart';
 import '../services/account_manager.dart';
 import '../services/telegram_service.dart';
+import '../services/youtube_sync.dart';
 import '../services/folder_store.dart';
 import 'folder_strip.dart';
 import 'reel_player_page.dart';
@@ -64,8 +65,24 @@ class _UploadQueuePageState extends State<UploadQueuePage>
   static int _savedTabIndex = 0;
   static bool _savedShowPicker = true;
 
+  /// Which slice of the queue is on screen. Static for the same reason as
+  /// the scroll offsets: the shell rebuilds this page from scratch whenever
+  /// it refreshes, and a fresh element must not dump the user back to page 1.
+  static int _savedQueuePage = 0;
+
+  /// Jobs per queue page. One tile is a whole row with badges and progress,
+  /// so past a couple of dozen the list stops being scannable anyway — and a
+  /// bounded page keeps the eagerly-built `ListView` cheap.
+  static const int _queuePageSize = 20;
+
+  int _queuePage = 0;
+
   bool _gridRestored = false;
   bool _queueRestored = false;
+
+  /// Heartbeat for rolling the upload schedule forward and refreshing the
+  /// YT/TG badges while the page is alive.
+  Timer? _tick;
 
   /// Folder the picker grid is filtered to, or `null` for everything.
   String? _selectedFolderId;
@@ -76,6 +93,7 @@ class _UploadQueuePageState extends State<UploadQueuePage>
     if (!widget.isSentinel) {
       _localTabIndex = _savedTabIndex;
       _showPicker = _savedShowPicker;
+      _queuePage = _savedQueuePage;
     }
     WidgetsBinding.instance.addObserver(this);
     widget.scheduler.addListener(_onSchedulerChanged);
@@ -83,12 +101,16 @@ class _UploadQueuePageState extends State<UploadQueuePage>
     widget.folderStore?.addListener(_onFoldersChanged);
     _scrollCtrl.addListener(_onGridScrolled);
     _queueScrollCtrl.addListener(_onQueueScrolled);
+    if (!widget.isSentinel) {
+      _tick = Timer.periodic(const Duration(seconds: 60), (_) => _onTick());
+    }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _updateCurrentMonth();
       // Deleting a copy in the official Telegram app is invisible to us
       // until something asks Telegram about it — do that once the page is
       // up rather than waiting for the user to visit the Telegram tab.
       _requestBadgeCheck();
+      _refreshDefaultDestination();
     });
     _restoreScrollPosition();
     _loadGallery();
@@ -98,6 +120,33 @@ class _UploadQueuePageState extends State<UploadQueuePage>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
     _requestBadgeCheck();
+  }
+
+  /// One heartbeat while the page is alive. Scheduling only used to move
+  /// forward on a restart, so a queue left open across midnight would sit on
+  /// yesterday's date forever; the badge check rides along because deleted
+  /// copies on YouTube or Telegram are invisible until something asks.
+  void _onTick() {
+    if (!mounted || widget.isSentinel) return;
+    widget.scheduler.promoteDueScheduled();
+    _requestBadgeCheck();
+    // The drawer can flip the default destination while this page is behind
+    // it; the queue button's count is derived from it, so keep it current.
+    _refreshDefaultDestination();
+  }
+
+  /// The long-press path for a multi-selection: one sheet files every picked
+  /// tile at once, instead of dragging them onto chips one by one.
+  Future<void> _moveSelectionToFolder() async {
+    final store = widget.folderStore;
+    if (store == null || _selectedForQueue.isEmpty) return;
+    await showMoveToFolderSheet(
+      context,
+      store: store,
+      scope: FolderScope.local,
+      itemIds: [for (final a in _selectedForQueue) a.id],
+      currentFolderId: _selectedFolderId,
+    );
   }
 
   void _onFoldersChanged() {
@@ -112,6 +161,7 @@ class _UploadQueuePageState extends State<UploadQueuePage>
   @override
   void dispose() {
     _isDisposed = true;
+    _tick?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     widget.scheduler.removeListener(_onSchedulerChanged);
     widget.telegramService?.removeListener(_onTelegramChanged);
@@ -177,6 +227,7 @@ class _UploadQueuePageState extends State<UploadQueuePage>
   /// it comes back instead of staying marked as done.
   void _setShowPicker(bool value) {
     if (!widget.isSentinel) _savedShowPicker = value;
+    if (value) _refreshDefaultDestination();
     setState(() => _showPicker = value);
     _gridRestored = false;
     _queueRestored = false;
@@ -190,6 +241,21 @@ class _UploadQueuePageState extends State<UploadQueuePage>
     _gridRestored = false;
     setState(() => _localTabIndex = index);
     _restoreScrollPosition();
+  }
+
+  /// Moves to another slice of the queue. The saved scroll offset belongs to
+  /// the page it was taken on, so it is dropped rather than replayed against
+  /// a completely different set of tiles.
+  void _gotoQueuePage(int page) {
+    if (page == _queuePage) return;
+    _queuePage = page;
+    if (!widget.isSentinel) _savedQueuePage = page;
+    _savedQueueOffset = 0;
+    _queueRestored = true;
+    setState(() {});
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_queueScrollCtrl.hasClients) _queueScrollCtrl.jumpTo(0);
+    });
   }
 
   /// The Telegram page re-syncs history whenever it loads or refreshes, and
@@ -216,19 +282,61 @@ class _UploadQueuePageState extends State<UploadQueuePage>
   /// [force] bypasses the cooldown, used when something actually changed.
   void _requestBadgeCheck({bool force = false}) {
     if (!mounted || widget.isSentinel) return;
-    if (widget.telegramService == null) return;
     if (!force &&
         DateTime.now().difference(_lastBadgeCheck) <
             const Duration(seconds: 15)) {
       return;
     }
-    _verifyTelegramBadges(widget.telegramService!);
+    _lastBadgeCheck = DateTime.now();
+    final tel = widget.telegramService;
+    if (tel != null) _verifyTelegramBadges(tel);
+    _verifyYoutubeBadges();
+  }
+
+  bool _verifyingYoutube = false;
+
+  /// The YouTube half of the badge check: asks the channel which of the
+  /// uploads still exist, so a video deleted on YouTube stops wearing the YT
+  /// badge on the local grid — the same contract the Telegram check gives the
+  /// TG badge.
+  Future<void> _verifyYoutubeBadges() async {
+    if (_verifyingYoutube || widget.isSentinel) return;
+    final token = widget.accessToken;
+    if (token == null || token.isEmpty) return;
+    _verifyingYoutube = true;
+    try {
+      final jobs = widget.scheduler.jobs
+          .where((j) => j.status == JobStatus.completed && j.uploadedToYoutube)
+          .toList();
+      if (jobs.isEmpty) return;
+
+      final probes = [
+        for (final j in jobs)
+          YoutubeUploadProbe(
+            key: j.id,
+            videoId: j.youtubeVideoId,
+            title: j.title,
+          ),
+      ];
+
+      final verdict = await YoutubeSync.verifyUploads(token, probes);
+      // null = nothing could be verified; keep whatever we already knew
+      // instead of handing every badge back.
+      if (verdict == null) return;
+      widget.scheduler.applyYoutubeVerdict(
+        present: verdict.present,
+        absent: verdict.absent,
+      );
+    } catch (e) {
+      debugPrint('YouTube badge check failed: $e');
+    } finally {
+      _verifyingYoutube = false;
+    }
   }
 
   Future<void> _verifyTelegramBadges(TelegramService tel) async {
     if (_verifyingBadges) return;
     _verifyingBadges = true;
-    _lastBadgeCheck = DateTime.now();
     try {
       // The Telegram page is what usually restores the session, but the Local
       // page has to be able to verify on its own — otherwise the badge can
@@ -308,38 +416,137 @@ class _UploadQueuePageState extends State<UploadQueuePage>
     _processNextIfNeeded();
   }
 
-  Future<void> _addSelectedToQueue({UploadDestination destination = UploadDestination.youtube}) async {
-    if (_selectedForQueue.isEmpty) return;
+  /// Cached so the "Add N to Queue" count can mirror the routing
+  /// [_handleAddToQueue] will run without awaiting secure storage inside
+  /// build. Refreshed whenever that routing actually reads it.
+  UploadDestination _defaultDest = UploadDestination.youtube;
+
+  Future<UploadDestination> _readDefaultDestination() async {
+    _defaultDest = await TelegramService.getDefaultDestination();
+    return _defaultDest;
+  }
+
+  /// Re-reads the stored default and rebuilds only when it actually moved —
+  /// the drawer can change it while this page sits behind it.
+  Future<void> _refreshDefaultDestination() async {
+    final dest = await TelegramService.getDefaultDestination();
+    if (!mounted || dest == _defaultDest) return;
+    setState(() => _defaultDest = dest);
+  }
+
+  /// Whether [job] counts as work for [dest]'s side of the upload. Jobs are
+  /// created per destination, but a legacy `both` job covers both.
+  static bool _jobCovers(UploadJob job, UploadDestination dest) =>
+      job.destination == dest || job.destination == UploadDestination.both;
+
+  /// Whether the copy [job] stands for is still believed to be on [dest].
+  /// A completed job whose copy has since been deleted (the badge is cleared
+  /// by the verification pass) must never block re-uploading that video.
+  bool _jobStillThere(UploadJob job, UploadDestination dest) =>
+      dest == UploadDestination.telegram
+          ? widget.scheduler.isOnTelegram(job)
+          : widget.scheduler.isOnYoutube(job);
+
+  /// Whether [v] can still get a new job for [dest]: nothing in flight on
+  /// that side, and either no finished upload there or one whose copy is
+  /// gone. Everything about "why didn't my selection upload" comes back to
+  /// this predicate, so it is per destination — a video already queued for
+  /// Telegram is still fair game for YouTube, and a video deleted from
+  /// Telegram is fair game for Telegram again.
+  bool _canQueue(AssetEntity v, UploadDestination dest) {
+    if (dest == UploadDestination.telegram &&
+        widget.telegramService == null) {
+      return false;
+    }
+    // YouTube ingests video only; stills and audio would just fail.
+    if (dest == UploadDestination.youtube && v.type != AssetType.video) {
+      return false;
+    }
+    for (final j in widget.scheduler.jobs) {
+      if (j.assetId != v.id || !_jobCovers(j, dest)) continue;
+      if (j.status != JobStatus.completed) return false;
+      if (_jobStillThere(j, dest)) return false;
+    }
+    return true;
+  }
+
+  /// How many of [assets] would really get a job from the routing
+  /// [_handleAddToQueue] performs for the current default destination. The
+  /// button label has to agree with what happens, or the user counts the
+  /// tiles and gets a different number of uploads.
+  int _addToQueueCount(Iterable<AssetEntity> assets) {
+    if (widget.telegramService == null) {
+      return assets.where((v) => _canQueue(v, UploadDestination.youtube)).length;
+    }
+    switch (_defaultDest) {
+      case UploadDestination.telegram:
+        return assets
+            .where((v) => _canQueue(v, UploadDestination.telegram))
+            .length;
+      case UploadDestination.youtube:
+        // Still files cannot go to YouTube, so that case falls through to
+        // the destination dialog whose only live option is Telegram.
+        if (assets.any((v) => v.type != AssetType.video)) {
+          return assets
+              .where((v) => _canQueue(v, UploadDestination.telegram))
+              .length;
+        }
+        return assets
+            .where((v) => _canQueue(v, UploadDestination.youtube))
+            .length;
+      case UploadDestination.both:
+        return assets
+            .where((v) =>
+                _canQueue(v, UploadDestination.youtube) ||
+                _canQueue(v, UploadDestination.telegram))
+            .length;
+    }
+  }
+
+  /// Queues [assets] once per entry in [destinations] — separately, because
+  /// coverage is per destination and a Telegram job must not disqualify the
+  /// same video from going to YouTube.
+  ///
+  /// Returns how many distinct assets received at least one job.
+  Future<int> _addAssetsToQueue(
+    List<AssetEntity> assets, {
+    required List<UploadDestination> destinations,
+    String? folder,
+    bool clearSelection = false,
+  }) async {
+    if (assets.isEmpty || destinations.isEmpty) return 0;
 
     final channelId = widget.accountManager.selectedChannelId;
     final email = widget.accountManager.currentAccount?.email ?? '';
     final now = DateTime.now();
     final titleFmt = DateFormat('dd MMMM yyyy HH:mm');
-    final filtered = _selectedForQueue.where((v) {
-      for (final j in widget.scheduler.jobs) {
-        if (v.id == j.assetId && j.status != JobStatus.completed) return false;
-        if (v.id == j.assetId && j.status == JobStatus.completed) return false;
-      }
-      return true;
-    }).toList();
-    if (filtered.isEmpty) return;
-    final items = filtered;
+    final queued = <String>{};
 
-    final entries = <Map<String, String>>[];
-    for (int i = 0; i < items.length; i++) {
-      final v = items[i];
-      final file = await v.file;
-      final ts = now.add(Duration(minutes: i));
-      entries.add({
-        'assetId': v.id,
-        'title': titleFmt.format(ts),
-        if (file != null) 'filePath': file.path,
-      });
+    for (final destination in destinations) {
+      final targets = assets.where((v) => _canQueue(v, destination)).toList();
+      if (targets.isEmpty) continue;
+
+      final entries = <Map<String, String>>[];
+      for (int i = 0; i < targets.length; i++) {
+        final v = targets[i];
+        final file = await v.file;
+        final ts = now.add(Duration(minutes: i));
+        entries.add({
+          'assetId': v.id,
+          'title': titleFmt.format(ts),
+          if (file != null) 'filePath': file.path,
+        });
+      }
+
+      await widget.scheduler.addJobs(entries, channelId, email,
+          destination: destination, folder: folder);
+      queued.addAll(targets.map((v) => v.id));
     }
 
-    await widget.scheduler.addJobs(entries, channelId, email, destination: destination);
-
-    setState(() => _selectedForQueue.removeWhere((v) => filtered.contains(v)));
+    if (clearSelection && mounted) {
+      setState(() => _selectedForQueue.clear());
+    }
+    return queued.length;
   }
 
   Future<void> _deleteSelected() async {
@@ -375,39 +582,109 @@ class _UploadQueuePageState extends State<UploadQueuePage>
     });
   }
 
-  bool get _hasNonVideo =>
-      _selectedForQueue.any((a) => a.type == AssetType.image);
+  bool _hasNonVideo(Iterable<AssetEntity> assets) =>
+      assets.any((a) => a.type != AssetType.video);
 
-  Future<void> _handleAddToQueue() async {
+  /// Routes [assets] through the app-wide default destination and queues
+  /// them there. [folder], when given, tags the jobs so the upload lands in
+  /// that folder on both sides (Telegram `#caption`, YouTube playlist) and
+  /// the queue row shows where it came from.
+  ///
+  /// Returns how many assets actually received a job.
+  /// [announce] is turned off by callers that show their own, more specific
+  /// toast — two back-to-back toasts for one action just talk over each other.
+  Future<int> _handleAddToQueue({
+    required List<AssetEntity> assets,
+    String? folder,
+    bool clearSelection = false,
+    bool announce = true,
+  }) async {
+    if (assets.isEmpty) return 0;
     final tel = widget.telegramService;
     if (tel == null) {
-      await _addSelectedToQueue(destination: UploadDestination.youtube);
+      return _addAssetsToQueue(assets,
+          destinations: const [UploadDestination.youtube],
+          folder: folder,
+          clearSelection: clearSelection);
+    }
+    final defaultDest = await _readDefaultDestination();
+    final mixed = _hasNonVideo(assets);
+
+    switch (defaultDest) {
+      case UploadDestination.telegram:
+        final n = await _addAssetsToQueue(assets,
+            destinations: const [UploadDestination.telegram],
+            folder: folder,
+            clearSelection: clearSelection);
+        if (n > 0 && announce) {
+          Fluttertoast.showToast(msg: 'Added to Telegram queue');
+        }
+        return n;
+
+      case UploadDestination.both:
+        // One pass, both sides. Queueing Telegram first and then reading the
+        // selection again for YouTube used to find it empty — the first pass
+        // had already cleared it — which is how "both" uploaded to Telegram
+        // only. Coverage is per destination, so the second destination still
+        // queues the same videos.
+        final n = await _addAssetsToQueue(assets,
+            destinations: const [
+              UploadDestination.telegram,
+              UploadDestination.youtube,
+            ],
+            folder: folder,
+            clearSelection: clearSelection);
+        if (n > 0 && announce) {
+          Fluttertoast.showToast(msg: 'Added to YouTube + Telegram queue');
+        }
+        return n;
+
+      case UploadDestination.youtube:
+        if (!mixed) {
+          return _addAssetsToQueue(assets,
+              destinations: const [UploadDestination.youtube],
+              folder: folder,
+              clearSelection: clearSelection);
+        }
+        final dest = await _showDestinationPicker(true);
+        if (dest == null) return 0;
+        return _addAssetsToQueue(assets,
+            destinations: [dest],
+            folder: folder,
+            clearSelection: clearSelection);
+    }
+  }
+
+  /// Long-press a folder chip → "Upload folder": every item in the folder is
+  /// queued through the default destination (YouTube / Telegram / both),
+  /// tagged with the folder name — so the Telegram copy carries the
+  /// `#folder` caption, the YouTube copy lands in that playlist, and the
+  /// folder itself keeps holding exactly the videos that went up.
+  Future<void> _uploadFolder(MediaFolder folder) async {
+    final store = widget.folderStore;
+    if (store == null) return;
+    final ids = store.filterIds(FolderScope.local, folder.id);
+    final assets = ids == null
+        ? <AssetEntity>[]
+        : _galleryVideos.where((v) => ids.contains(v.id)).toList();
+    if (assets.isEmpty) {
+      Fluttertoast.showToast(msg: '${folder.name} has nothing to upload');
       return;
     }
-    final defaultDest = await TelegramService.getDefaultDestination();
-    final mixed = _hasNonVideo;
 
-    if (defaultDest == UploadDestination.telegram) {
-      await _addSelectedToQueue(destination: UploadDestination.telegram);
-      Fluttertoast.showToast(msg: 'Added to Telegram queue');
-      return;
-    }
+    // Membership is by asset id and idempotent, so re-filing is a no-op for
+    // items already dropped in and a catch-up for anything that arrived by
+    // another route (move sheet, backup import).
+    await store.addItems(folder.id, [for (final a in assets) a.id]);
 
-    if (defaultDest == UploadDestination.both && !mixed) {
-      await _addSelectedToQueueForBoth();
-      Fluttertoast.showToast(msg: 'Added to YouTube + Telegram queue');
-      return;
-    }
-
-    if (defaultDest == UploadDestination.youtube && !mixed) {
-      await _addSelectedToQueue(destination: UploadDestination.youtube);
-      return;
-    }
-
-    final dest = await _showDestinationPicker(mixed);
-    if (dest != null) {
-      await _addSelectedToQueue(destination: dest);
-    }
+    final queued = await _handleAddToQueue(
+        assets: assets, folder: folder.name, announce: false);
+    if (!mounted) return;
+    Fluttertoast.showToast(
+      msg: queued == 0
+          ? '${folder.name}: everything is already queued'
+          : 'Queued $queued of ${assets.length} from ${folder.name}',
+    );
   }
 
   Future<UploadDestination?> _showDestinationPicker(bool mixed) async {
@@ -451,11 +728,6 @@ class _UploadQueuePageState extends State<UploadQueuePage>
     );
   }
 
-  Future<void> _addSelectedToQueueForBoth() async {
-    await _addSelectedToQueue(destination: UploadDestination.telegram);
-    await _addSelectedToQueue(destination: UploadDestination.youtube);
-  }
-
   Future<void> _processNextIfNeeded() async {
     if (widget.isSentinel) return;
     if (_isUploading) return;
@@ -471,7 +743,17 @@ class _UploadQueuePageState extends State<UploadQueuePage>
     try {
       File? file;
 
-      final asset = _findAsset(job.assetId);
+      var asset = _findAsset(job.assetId);
+      if (asset == null) {
+        // The grid only holds the first page of each album, and a sync queues
+        // the oldest videos first — exactly the ones that may not be loaded
+        // here. Resolve by id rather than failing the upload as inaccessible.
+        try {
+          asset = await AssetEntity.fromId(job.assetId);
+        } catch (_) {
+          asset = null;
+        }
+      }
       if (asset != null) {
         file = await asset.file;
       }
@@ -506,6 +788,8 @@ class _UploadQueuePageState extends State<UploadQueuePage>
           videoWidth: asset?.width ?? 0,
           videoHeight: asset?.height ?? 0,
           videoDuration: asset?.duration ?? 0,
+          thumbBytes: asset != null ? await _telegramThumb(asset) : null,
+          videoHint: asset?.type == AssetType.video ? true : null,
         );
         // Record the real message id so the TG badge can later be verified
         // against Telegram instead of being trusted forever. Only a numeric
@@ -515,6 +799,9 @@ class _UploadQueuePageState extends State<UploadQueuePage>
         await widget.scheduler.markCompleted(
           job.id,
           telegramMessageId: sentId?.toString() ?? '',
+          // Whose account this landed in — the "Telegram today" number
+          // follows the phone number signed in, not the device.
+          telegramAccountId: tel.accountKey ?? '',
         );
         widget.scheduler.clearDeletedOnTelegram(job.id);
       } else {
@@ -593,6 +880,36 @@ class _UploadQueuePageState extends State<UploadQueuePage>
     }
   }
 
+  /// A JPEG frame to send with a Telegram upload. Telegram never generates a
+  /// preview for an uploaded video itself — official clients always attach
+  /// one — so without this the message arrives in Saved Messages with no
+  /// thumbnail. The first rendition that fits the API's ~200 KB thumb budget
+  /// wins, and a frame that never fits is dropped rather than failing the
+  /// upload.
+  Future<Uint8List?> _telegramThumb(AssetEntity asset) async {
+    if (asset.type == AssetType.audio || asset.type == AssetType.other) {
+      return null;
+    }
+    const maxBytes = 190 * 1024;
+    const attempts = [
+      (ThumbnailSize.square(320), 80),
+      (ThumbnailSize.square(240), 70),
+      (ThumbnailSize.square(160), 60),
+    ];
+    for (final (size, quality) in attempts) {
+      if (_isDisposed) return null;
+      try {
+        final bytes =
+            await asset.thumbnailDataWithSize(size, quality: quality);
+        if (bytes == null) return null;
+        if (bytes.length <= maxBytes) return bytes;
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+
   void _updateCurrentMonth() {
     if (!_scrollCtrl.hasClients || _galleryVideos.isEmpty) return;
     final viewportWidth = MediaQuery.of(context).size.width;
@@ -618,15 +935,15 @@ class _UploadQueuePageState extends State<UploadQueuePage>
 
   Widget _buildPickerView() {
     final alreadyInQueue = <String>{};
-    final alreadyUploaded = <String>{};
     final uploadedToYoutube = <String>{};
     final uploadedToTelegram = <String>{};
     for (final j in widget.scheduler.jobs) {
       if (j.status != JobStatus.completed) {
         alreadyInQueue.add(j.assetId);
       } else {
-        alreadyUploaded.add(j.assetId);
-        if (j.uploadedToYoutube) uploadedToYoutube.add(j.assetId);
+        // Both badges answer "is it still there", not "did it once
+        // upload" — a copy deleted on the service must stop claiming credit.
+        if (widget.scheduler.isOnYoutube(j)) uploadedToYoutube.add(j.assetId);
         if (widget.scheduler.isOnTelegram(j)) uploadedToTelegram.add(j.assetId);
       }
     }
@@ -642,6 +959,14 @@ class _UploadQueuePageState extends State<UploadQueuePage>
       if (_localTabIndex == 1) return v.type == AssetType.image;
       return v.type == AssetType.audio || v.type == AssetType.other;
     }).toList();
+
+    // Counts behind the V/P/F tooltips, taken from the folder in view so
+    // they agree with what the grid will show after a switch.
+    final videoCount = inFolder.where((v) => v.type == AssetType.video).length;
+    final photoCount = inFolder.where((v) => v.type == AssetType.image).length;
+    final fileCount = inFolder
+        .where((v) => v.type == AssetType.audio || v.type == AssetType.other)
+        .length;
 
     final inSelectedFolder = _selectedFolderId != null;
 
@@ -667,19 +992,32 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                 itemIds: [for (final a in _selectedForQueue) a.id],
               ),
             ),
-          if (_selectedForQueue.where((v) => !alreadyInQueue.contains(v.id) && !alreadyUploaded.contains(v.id)).isNotEmpty)
+          // Counted against the same per-destination rule the routing uses,
+          // so a video already on Telegram (or deleted from it) is picked up
+          // here instead of being silently skipped by the queue call.
+          if (_addToQueueCount(_selectedForQueue) > 0)
             TextButton(
               onPressed: () async {
-                await _handleAddToQueue();
+                await _handleAddToQueue(
+                  assets: _selectedForQueue.toList(),
+                  clearSelection: true,
+                );
                 _setShowPicker(false);
               },
-              child: Text('Add ${_selectedForQueue.where((v) => !alreadyInQueue.contains(v.id) && !alreadyUploaded.contains(v.id)).length} to Queue'),
+              child: Text(
+                  'Add ${_addToQueueCount(_selectedForQueue)} to Queue'),
             ),
           if (_selectedForQueue.isNotEmpty)
             IconButton(
               icon: Icon(Icons.delete_outline, color: Colors.red[300]),
               onPressed: () => _deleteSelected(),
             ),
+          // The media filters moved up here from their own row: one letter
+          // each keeps all three narrow enough to live in the bar, and the
+          // grid gets the full height the old row used to eat.
+          _buildAppBarTab(0, 'V', videoCount),
+          _buildAppBarTab(1, 'P', photoCount),
+          _buildAppBarTab(2, 'F', fileCount),
           IconButton(
             icon: const Icon(Icons.queue_rounded),
             onPressed: () => _setShowPicker(false),
@@ -690,17 +1028,12 @@ class _UploadQueuePageState extends State<UploadQueuePage>
           ? const Center(child: CircularProgressIndicator())
           : Column(
               children: [
-                Container(
-                  padding: EdgeInsets.fromLTRB(12, MediaQuery.of(context).padding.top + kToolbarHeight + 4, 12, 4),
-                  child: Row(
-                    children: [
-                      _buildLocalTab(0, 'Videos', inFolder.where((v) => v.type == AssetType.video).length, Icons.videocam),
-                      const SizedBox(width: 8),
-                      _buildLocalTab(1, 'Images', inFolder.where((v) => v.type == AssetType.image).length, Icons.image),
-                      const SizedBox(width: 8),
-                      _buildLocalTab(2, 'Files', inFolder.where((v) => v.type == AssetType.audio || v.type == AssetType.other).length, Icons.insert_drive_file),
-                    ],
-                  ),
+                // The V/P/F filters live in the app bar now, so this is only
+                // the clearance the tab row used to provide under the
+                // transparent bar — the grid starts right below it.
+                SizedBox(
+                  height:
+                      MediaQuery.of(context).padding.top + kToolbarHeight + 8,
                 ),
                 if (widget.folderStore != null)
                   FolderStrip(
@@ -711,6 +1044,7 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                       _selectedFolderId = id;
                       _selectedForQueue.clear();
                     }),
+                    onUploadFolder: _uploadFolder,
                   ),
                 Expanded(
                   child: filtered.isEmpty
@@ -754,12 +1088,23 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                       final v = filtered[i];
                       final selected = _selectedForQueue.contains(v);
                       final inQueue = alreadyInQueue.contains(v.id);
-                      final isUploaded = alreadyUploaded.contains(v.id);
                       final onYt = uploadedToYoutube.contains(v.id);
                       final onTg = uploadedToTelegram.contains(v.id);
+                      // With several tiles picked, a long-press on one of
+                      // them opens the "move selected to folders" sheet; the
+                      // drag-to-chip gesture keeps the tile when nothing is
+                      // picked. One long-press cannot be both.
+                      final moveSelection =
+                          _selectedForQueue.length > 1 && selected;
+                      // Selection is gated on still having somewhere to send
+                      // the tile, not on "has any job at all": a video whose
+                      // Telegram copy was deleted, or that is queued for
+                      // Telegram only, still has an upload left to do.
+                      final queueable = _canQueue(v, UploadDestination.youtube) ||
+                          _canQueue(v, UploadDestination.telegram);
                       final tile = GestureDetector(
                         onTap: () {
-                          if (inQueue) return;
+                          if (!queueable) return;
                           setState(() {
                             if (selected) {
                               _selectedForQueue.remove(v);
@@ -768,6 +1113,8 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                             }
                           });
                         },
+                        onLongPress:
+                            moveSelection ? _moveSelectionToFolder : null,
                         onDoubleTap: () {
                           if (inQueue) return;
                           // The grid is filtered per tab while the player is
@@ -806,7 +1153,7 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                                   child: const Text('In Queue', style: TextStyle(color: Colors.white, fontSize: 8)),
                                 ),
                               ),
-                            if (isUploaded)
+                            if (onYt || onTg)
                               Positioned(
                                 top: 4, left: 4,
                                 child: Row(
@@ -827,6 +1174,15 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                                   ],
                                 ),
                               ),
+                            if (widget.folderStore != null)
+                              Positioned(
+                                left: 4, bottom: 4,
+                                child: FolderTags(
+                                  store: widget.folderStore!,
+                                  scope: FolderScope.local,
+                                  itemId: v.id,
+                                ),
+                              ),
                             if (selected && !inQueue)
                               Container(
                                 decoration: BoxDecoration(
@@ -840,6 +1196,7 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                           ],
                         ),
                       );
+                      if (moveSelection) return tile;
                       return LongPressDraggable<List<String>>(
                         data: selected
                             ? [for (final a in _selectedForQueue) a.id]
@@ -872,30 +1229,36 @@ class _UploadQueuePageState extends State<UploadQueuePage>
     );
   }
 
-  Widget _buildLocalTab(int index, String label, int count, IconData icon) {
+  /// One media filter in the app bar: a single letter (V/P/F) with the full
+  /// name and the live count of the folder in view as its tooltip. Tapping
+  /// it swaps the grid exactly as the old tab row did.
+  Widget _buildAppBarTab(int index, String letter, int count) {
+    const labels = ['Videos', 'Photos', 'Files'];
     final selected = _localTabIndex == index;
-    return Expanded(
-      child: GestureDetector(
-        onTap: () => _setLocalTabIndex(index),
-        child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 10),
-          decoration: BoxDecoration(
-            color: selected ? Colors.green : Colors.grey[900],
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, size: 16, color: selected ? Colors.white : Colors.grey),
-              const SizedBox(width: 6),
-              Text(label, style: TextStyle(color: selected ? Colors.white : Colors.grey, fontSize: 13, fontWeight: FontWeight.w600)),
-              const SizedBox(width: 4),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(color: selected ? Colors.white24 : Colors.grey[800], borderRadius: BorderRadius.circular(8)),
-                child: Text('$count', style: TextStyle(color: selected ? Colors.white : Colors.grey, fontSize: 10)),
-              ),
-            ],
+    return Padding(
+      padding: const EdgeInsets.only(right: 4),
+      child: Tooltip(
+        message: '${labels[index]} ($count)',
+        child: GestureDetector(
+          onTap: () => _setLocalTabIndex(index),
+          behavior: HitTestBehavior.opaque,
+          child: Container(
+            width: 26,
+            height: 26,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: selected ? Colors.green : Colors.grey[900],
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                  color: selected ? Colors.green : Colors.grey[700]!),
+            ),
+            child: Text(
+              letter,
+              style: TextStyle(
+                  color: selected ? Colors.white : Colors.grey[400],
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold),
+            ),
           ),
         ),
       ),
@@ -933,13 +1296,45 @@ class _UploadQueuePageState extends State<UploadQueuePage>
   }
 
   Widget _buildQueueView() {
-    final ytToday = widget.scheduler.todayYoutubeCount;
-    final tgToday = widget.scheduler.todayTelegramCount;
+    // Both counters answer for the account in view: YouTube's 15-a-day is
+    // per channel, Telegram's uploads belong to the signed-in phone number.
+    final channel = widget.accountManager.selectedChannel;
+    final ytToday =
+        widget.scheduler.todayYoutubeCountForChannel(channel?.id);
+    final tgToday = widget.scheduler
+        .todayTelegramCountForAccount(widget.telegramService?.accountKey);
+    final tgPhone = widget.telegramService?.accountPhone;
+    final paused = widget.scheduler.paused;
     final all = widget.scheduler.jobs;
     final active = all.where((j) => j.status == JobStatus.pending || j.status == JobStatus.uploading).toList();
     final scheduled = widget.scheduler.scheduledJobs.toList();
     final completed = widget.scheduler.completedJobs.toList();
     final failed = widget.scheduler.failedJobs.toList();
+
+    // One flat list in display order, then a slice of it per page. Sections
+    // are rebuilt from the slice, so a header only appears when its kind has
+    // rows on this page — and Active always sorts first, which keeps the
+    // upload in flight on page 1 no matter how much history piled up behind.
+    final ordered = <UploadJob>[
+      ...active, ...scheduled, ...failed, ...completed,
+    ];
+    var totalPages = (ordered.length + _queuePageSize - 1) ~/ _queuePageSize;
+    if (totalPages < 1) totalPages = 1;
+    var page = _queuePage;
+    if (page > totalPages - 1) page = totalPages - 1;
+    if (page < 0) page = 0;
+    final slice = ordered
+        .skip(page * _queuePageSize)
+        .take(_queuePageSize)
+        .toList();
+    final pageActive =
+        slice.where((j) => j.status == JobStatus.pending || j.status == JobStatus.uploading).toList();
+    final pageScheduled =
+        slice.where((j) => j.status == JobStatus.scheduled).toList();
+    final pageFailed =
+        slice.where((j) => j.status == JobStatus.failed).toList();
+    final pageCompleted =
+        slice.where((j) => j.status == JobStatus.completed).toList();
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -949,6 +1344,13 @@ class _UploadQueuePageState extends State<UploadQueuePage>
             ? 'Queue (Telegram)'
             : 'Upload Queue'),
         actions: [
+          IconButton(
+            icon: paused
+                ? const Icon(Icons.play_circle, color: Colors.green)
+                : const Icon(Icons.pause_circle, color: Colors.amber),
+            tooltip: paused ? 'Resume whole queue' : 'Pause whole queue',
+            onPressed: () => widget.scheduler.setPaused(!paused),
+          ),
           if (all.where((j) => j.status == JobStatus.pending || j.status == JobStatus.scheduled).isNotEmpty)
             PopupMenuButton<String>(
               icon: const Icon(Icons.play_arrow, color: Colors.green),
@@ -1023,7 +1425,15 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                         children: [
                           const Icon(Icons.videocam, color: Colors.red, size: 18),
                           const SizedBox(width: 8),
-                          Text('YouTube Today', style: TextStyle(color: Colors.grey[300], fontSize: 13)),
+                          Flexible(
+                            child: Text(
+                                channel != null &&
+                                        widget.accountManager.channels.length > 1
+                                    ? 'YouTube Today · ${channel.title}'
+                                    : 'YouTube Today',
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(color: Colors.grey[300], fontSize: 13)),
+                          ),
                           const Spacer(),
                           Text('$ytToday/${UploadScheduler.youtubeDailyLimit}',
                               style: TextStyle(color: Colors.grey[300], fontWeight: FontWeight.bold)),
@@ -1048,7 +1458,14 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                         children: [
                           const Icon(Icons.telegram, color: Colors.blue, size: 18),
                           const SizedBox(width: 8),
-                          Text('Telegram Today', style: TextStyle(color: Colors.grey[300], fontSize: 13)),
+                          Flexible(
+                            child: Text(
+                                tgPhone != null
+                                    ? 'Telegram Today · $tgPhone'
+                                    : 'Telegram Today',
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(color: Colors.grey[300], fontSize: 13)),
+                          ),
                           const Spacer(),
                           Text('$tgToday',
                               style: TextStyle(color: Colors.grey[300], fontWeight: FontWeight.bold)),
@@ -1071,33 +1488,83 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                     ],
                   ),
                 ),
+                if (paused) ...[
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: Colors.amber.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Colors.amber.withValues(alpha: 0.5)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.pause_circle, color: Colors.amber, size: 18),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Queue paused — nothing new will start until you resume',
+                            style: TextStyle(color: Colors.amber[200], fontSize: 12),
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () => widget.scheduler.setPaused(false),
+                          child: const Text('Resume',
+                              style: TextStyle(color: Colors.green, fontSize: 12)),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 16),
 
-                if (active.isNotEmpty) ...[
-                  Text('Active', style: TextStyle(color: Colors.grey[400], fontSize: 13, fontWeight: FontWeight.w600)),
+                if (pageActive.isNotEmpty) ...[
+                  Text('Active (${pageActive.length})', style: TextStyle(color: Colors.grey[400], fontSize: 13, fontWeight: FontWeight.w600)),
                   const SizedBox(height: 6),
-                  ...active.map((job) => _buildJobTile(job)),
+                  ...pageActive.map((job) => _buildJobTile(job)),
                   const SizedBox(height: 16),
                 ],
 
-                if (scheduled.isNotEmpty) ...[
-                  Text('Scheduled', style: TextStyle(color: Colors.grey[400], fontSize: 13, fontWeight: FontWeight.w600)),
+                if (pageScheduled.isNotEmpty) ...[
+                  Text('Scheduled (${pageScheduled.length})', style: TextStyle(color: Colors.grey[400], fontSize: 13, fontWeight: FontWeight.w600)),
                   const SizedBox(height: 6),
-                  ...scheduled.map((job) => _buildJobTile(job)),
+                  ...pageScheduled.map((job) => _buildJobTile(job)),
                   const SizedBox(height: 16),
                 ],
 
-                if (failed.isNotEmpty) ...[
-                  Text('Failed', style: TextStyle(color: Colors.red[400], fontSize: 13, fontWeight: FontWeight.w600)),
+                if (pageFailed.isNotEmpty) ...[
+                  Text('Failed (${pageFailed.length})', style: TextStyle(color: Colors.red[400], fontSize: 13, fontWeight: FontWeight.w600)),
                   const SizedBox(height: 6),
-                  ...failed.map((job) => _buildJobTile(job)),
+                  ...pageFailed.map((job) => _buildJobTile(job)),
                   const SizedBox(height: 16),
                 ],
 
-                if (completed.isNotEmpty) ...[
-                  Text('Completed', style: TextStyle(color: Colors.grey[400], fontSize: 13, fontWeight: FontWeight.w600)),
+                if (pageCompleted.isNotEmpty) ...[
+                  Text('Completed (${completed.length})', style: TextStyle(color: Colors.grey[400], fontSize: 13, fontWeight: FontWeight.w600)),
                   const SizedBox(height: 6),
-                  ...completed.take(20).map((job) => _buildJobTile(job)),
+                  ...pageCompleted.map((job) => _buildJobTile(job)),
+                ],
+
+                if (totalPages > 1) ...[
+                  const SizedBox(height: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.chevron_left, color: Colors.white70),
+                        onPressed:
+                            page > 0 ? () => _gotoQueuePage(page - 1) : null,
+                      ),
+                      Text('Page ${page + 1} of $totalPages',
+                          style: TextStyle(color: Colors.grey[400], fontSize: 13)),
+                      IconButton(
+                        icon: const Icon(Icons.chevron_right, color: Colors.white70),
+                        onPressed: page < totalPages - 1
+                            ? () => _gotoQueuePage(page + 1)
+                            : null,
+                      ),
+                    ],
+                  ),
                 ],
               ],
             ),
@@ -1109,15 +1576,46 @@ class _UploadQueuePageState extends State<UploadQueuePage>
     return c?.title ?? channelId;
   }
 
+  /// The swipe only *offers* the delete; nothing leaves the queue until
+  /// this says yes, so a stray flick cannot take a queued or finished
+  /// upload — and the history behind the statistics — with it.
+  Future<bool> _confirmRemove(UploadJob job) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.grey[900],
+        title: const Text('Remove from queue?',
+            style: TextStyle(color: Colors.white)),
+        content: Text(
+          job.displayName,
+          style: TextStyle(color: Colors.grey[400]),
+          maxLines: 3,
+          overflow: TextOverflow.ellipsis,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child:
+                const Text('Remove', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    return confirmed == true;
+  }
+
   Widget _buildJobTile(UploadJob job) {
     final dateFmt = DateFormat('MMM d, HH:mm');
     return Dismissible(
       key: Key(job.id),
-      direction: job.status == JobStatus.pending || job.status == JobStatus.scheduled || job.status == JobStatus.uploading || job.status == JobStatus.failed
-          ? DismissDirection.endToStart
-          : DismissDirection.none,
+      direction: DismissDirection.endToStart,
       background: Container(color: Colors.red, alignment: Alignment.centerRight, padding: const EdgeInsets.only(right: 16),
         child: const Icon(Icons.delete, color: Colors.white)),
+      confirmDismiss: (_) => _confirmRemove(job),
       onDismissed: (_) => widget.scheduler.remove(job.id),
       child: Container(
         margin: const EdgeInsets.only(bottom: 6),
@@ -1130,7 +1628,7 @@ class _UploadQueuePageState extends State<UploadQueuePage>
           children: [
             Icon(_statusIcon(job.status), color: _statusColor(job.status), size: 20),
             const SizedBox(width: 8),
-            if (job.uploadedToYoutube)
+            if (widget.scheduler.isOnYoutube(job))
               Container(
                 margin: const EdgeInsets.only(right: 4),
                 padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),

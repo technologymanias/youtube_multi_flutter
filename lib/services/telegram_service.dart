@@ -19,6 +19,12 @@ class TelegramService extends ChangeNotifier {
   /// exactly like "I was logged out" and forces a fresh OTP login.
   static const String _dcKey = 'telegram_session_dc';
   static const String _defaultDestKey = 'telegram_default_destination';
+
+  /// Which account is signed in, remembered across launches so the upload
+  /// statistics can be scoped to it before the Telegram page has had a
+  /// chance to reconnect.
+  static const String _accountKeyKey = 'telegram_account_key';
+  static const String _accountPhoneKey = 'telegram_account_phone';
   static const _storage = FlutterSecureStorage();
 
   /// Telegram's server decides whether a document is a "video" from the
@@ -86,6 +92,89 @@ class TelegramService extends ChangeNotifier {
 
   bool get isConnected => _connected;
   bool get isAuthenticated => _authenticated;
+
+  /// The signed-in Telegram account as a stable id (Telegram's user id never
+  /// changes for one phone number), used to scope "Telegram today" to the
+  /// account whose uploads it is counting. Null until it is known.
+  String? get accountKey => _accountKey;
+
+  /// The same account as a displayable phone number, for labelling the
+  /// number on the stats page. Null when Telegram did not hand one over.
+  String? get accountPhone => _accountPhone;
+
+  String? _accountKey;
+  String? _accountPhone;
+
+  /// Reads the remembered account so counts are scoped from the first
+  /// frame, without waiting for a connection that may only happen when the
+  /// Telegram page is opened.
+  Future<void> loadAccountKey() async {
+    try {
+      final key = await _storage.read(key: _accountKeyKey);
+      final phone = await _storage.read(key: _accountPhoneKey);
+      if (key == null || key.isEmpty) return;
+      final changed = key != _accountKey || phone != _accountPhone;
+      _accountKey = key;
+      _accountPhone = (phone == null || phone.isEmpty) ? null : phone;
+      if (changed) notifyListeners();
+    } catch (e) {
+      debugPrint('[TG] could not read stored account: $e');
+    }
+  }
+
+  /// Resolves who is signed in, unless that is already known. [force]
+  /// discards the remembered answer first — needed after signing into a
+  /// possibly different account, where the cached id belongs to the one
+  /// logged out.
+  Future<String?> ensureAccountKey({bool force = false}) async {
+    if (force) {
+      // Both, not just the id: a label from the previous account must not
+      // outlive the number it belonged to.
+      _accountKey = null;
+      _accountPhone = null;
+    }
+    if (_accountKey != null && _accountKey!.isNotEmpty) return _accountKey;
+    if (_client == null) return _accountKey;
+    try {
+      final res = await _client!.users
+          .getUsers(id: [const t.InputUserSelf()])
+          .timeout(const Duration(seconds: 15));
+      if (res.error != null || res.result == null) return _accountKey;
+      final users = res.result as t.Vector<t.UserBase>;
+      for (final u in users.items) {
+        if (u is t.User) {
+          await _rememberAccount(u);
+          break;
+        }
+      }
+    } catch (e) {
+      debugPrint('[TG] could not resolve signed-in account: $e');
+    }
+    return _accountKey;
+  }
+
+  /// Records [user] as the signed-in account, persisting it so the counts
+  /// stay scoped to the same phone number after a restart.
+  Future<void> _rememberAccount(t.User user) async {
+    final key = '${user.id}';
+    final phone =
+        (user.phone == null || user.phone!.isEmpty) ? null : '+${user.phone}';
+    final changed = key != _accountKey || phone != _accountPhone;
+    _accountKey = key;
+    _accountPhone = phone;
+    if (!changed) return;
+    try {
+      await _storage.write(key: _accountKeyKey, value: key);
+      if (phone != null) {
+        await _storage.write(key: _accountPhoneKey, value: phone);
+      } else {
+        await _storage.delete(key: _accountPhoneKey);
+      }
+    } catch (e) {
+      debugPrint('[TG] could not persist signed-in account: $e');
+    }
+    notifyListeners();
+  }
 
   /// Production datacenters, used only when a session was saved without a DC.
   static t.DcOption _mkDc(int id, String ip) => t.DcOption(
@@ -159,6 +248,15 @@ class TelegramService extends ChangeNotifier {
         }
 
         _authenticated = true;
+        // The check already asked Telegram who holds this key, so reading
+        // the answer costs nothing and pins the stats to this account.
+        final users = check.result as t.Vector<t.UserBase>;
+        for (final u in users.items) {
+          if (u is t.User) {
+            await _rememberAccount(u);
+            break;
+          }
+        }
         await _persistDc();
         notifyListeners();
         return true;
@@ -327,6 +425,9 @@ class TelegramService extends ChangeNotifier {
     await _storage.write(key: _sessionKey, value: jsonEncode(json));
     await _persistDc();
     _authenticated = true;
+    // A fresh sign-in may be a different phone number than the one that was
+    // remembered, so the cached id must not survive it.
+    await ensureAccountKey(force: true);
     notifyListeners();
   }
 
@@ -429,11 +530,16 @@ class TelegramService extends ChangeNotifier {
     int videoWidth = 0,
     int videoHeight = 0,
     int videoDuration = 0,
+    Uint8List? thumbBytes,
+    bool? videoHint,
   }) {
     if (_uploadBusy) onStatus?.call('Waiting for the current upload…');
     return _serialized(() async {
       _uploadBusy = true;
       try {
+        // The upload's completion is what gets counted, so make sure the
+        // account it is going to is known before it lands.
+        await ensureAccountKey();
         return await _uploadToSavedMessages(
           filePath,
           caption: caption,
@@ -441,6 +547,8 @@ class TelegramService extends ChangeNotifier {
           videoWidth: videoWidth,
           videoHeight: videoHeight,
           videoDuration: videoDuration,
+          thumbBytes: thumbBytes,
+          videoHint: videoHint,
         );
       } finally {
         _uploadBusy = false;
@@ -455,6 +563,8 @@ class TelegramService extends ChangeNotifier {
     int videoWidth = 0,
     int videoHeight = 0,
     int videoDuration = 0,
+    Uint8List? thumbBytes,
+    bool? videoHint,
   }) async {
     final file = File(filePath);
     final fileBytes = await file.readAsBytes();
@@ -483,6 +593,8 @@ class TelegramService extends ChangeNotifier {
             videoWidth: videoWidth,
             videoHeight: videoHeight,
             videoDuration: videoDuration,
+            thumbBytes: thumbBytes,
+            videoHint: videoHint,
             fileId: fileId,
             randomId: randomId,
             uploadedParts: uploadedParts);
@@ -514,6 +626,8 @@ class TelegramService extends ChangeNotifier {
     int videoWidth = 0,
     int videoHeight = 0,
     int videoDuration = 0,
+    Uint8List? thumbBytes,
+    bool? videoHint,
     required int fileId,
     required int randomId,
     required Set<int> uploadedParts,
@@ -546,8 +660,13 @@ class TelegramService extends ChangeNotifier {
         : t.InputFile(id: fileId, parts: totalParts, name: fileName, md5Checksum: '');
 
     final ext = fileName.split('.').last.toLowerCase();
-    final isVideo = _videoMimeTypes.containsKey(ext);
+    final extIsVideo = _videoMimeTypes.containsKey(ext);
     final isImage = _imageMimeTypes.containsKey(ext);
+    // The caller knows an asset is a video even when its extension is one we
+    // do not list. Falling through to the generic document branch would put
+    // it in the chat's Files tab with no player, which is exactly how a
+    // correctly-typed video ends up "unplayable".
+    final isVideo = extIsVideo || videoHint == true;
 
     late t.InputMediaBase media;
     if (isVideo) {
@@ -556,7 +675,8 @@ class TelegramService extends ChangeNotifier {
         forceFile: false,
         spoiler: false,
         file: inputFile,
-        mimeType: _videoMimeTypes[ext]!,
+        thumb: await _uploadThumb(thumbBytes, onStatus: onStatus),
+        mimeType: _videoMimeTypes[ext] ?? 'video/mp4',
         attributes: [
           t.DocumentAttributeVideo(
             roundMessage: false,
@@ -584,6 +704,7 @@ class TelegramService extends ChangeNotifier {
         forceFile: isImage,
         spoiler: false,
         file: inputFile,
+        thumb: await _uploadThumb(thumbBytes, onStatus: onStatus),
         mimeType: isImage
             ? _imageMimeTypes[ext]!
             : 'application/octet-stream',
@@ -613,6 +734,65 @@ class TelegramService extends ChangeNotifier {
     }
 
     return sendResult;
+  }
+
+  /// Telegram never builds a preview for an uploaded document: official
+  /// clients always send a JPEG frame alongside the video, and without one
+  /// the message arrives with no thumbnail and no playable preview in the
+  /// Telegram app. The frame travels as its own single-part file upload.
+  ///
+  /// Returns null — rather than failing the whole send — when there is no
+  /// frame to send or the bytes are over the API's ~200 KB thumb budget,
+  /// because a missing preview only costs a preview.
+  Future<t.InputFileBase?> _uploadThumb(
+    Uint8List? bytes, {
+    void Function(String)? onStatus,
+  }) async {
+    if (bytes == null || bytes.isEmpty) return null;
+    const maxThumbBytes = 190 * 1024;
+    if (bytes.length > maxThumbBytes) {
+      debugPrint(
+          '[Upload] thumb is ${bytes.length} B, over the $maxThumbBytes B '
+          'budget — sending without a preview');
+      return null;
+    }
+
+    final thumbFileId =
+        Random().nextInt(1 << 30) + (Random().nextInt(1 << 30) << 30);
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (attempt > 0) {
+          onStatus?.call('Reconnecting… (thumbnail)');
+          await ensureConnected(force: true);
+        }
+        final client = _client;
+        if (client == null) throw StateError('Not connected');
+        final res = await client.upload
+            .saveFilePart(
+              fileId: thumbFileId,
+              filePart: 0,
+              bytes: Uint8List.fromList(bytes),
+            )
+            .timeout(const Duration(seconds: 30));
+        if (res.error != null) {
+          throw Exception('thumbnail upload failed: ${res.error}');
+        }
+        if (res.result == null || !res.result!.value) {
+          throw Exception('thumbnail upload rejected by the server');
+        }
+        return t.InputFile(
+          id: thumbFileId,
+          parts: 1,
+          name: 'thumb.jpg',
+          md5Checksum: '',
+        );
+      } catch (e) {
+        debugPrint('[Upload] thumbnail attempt ${attempt + 1} failed: $e');
+        if (_isNonRetryable(e)) rethrow;
+      }
+    }
+    debugPrint('[Upload] thumbnail gave up after 3 attempts');
+    return null;
   }
 
   /// Uploads one chunk, retrying with a forced reconnect on timeout/socket
@@ -684,11 +864,109 @@ class TelegramService extends ChangeNotifier {
   /// True once at least one history fetch has succeeded in this run.
   bool get hasSynced => _hasSyncedMessages;
 
-  Future<List<SavedMessageItem>> getSavedMessages({int limit = 50}) async {
+  /// Everything the grid can show: a walk through history plus one
+  /// server-side filter query per media category, merged by message id.
+  ///
+  /// The walk on its own is not enough. It only ever hands back what the
+  /// server is willing to page to, and in a chat whose newest messages are
+  /// all videos — which is exactly what this app fills Saved Messages with —
+  /// the photos and files sit thousands of messages deeper, past wherever
+  /// that walk stops. So each tab's media is also asked for directly with
+  /// `messages.search`, the same query official clients use to fill a media
+  /// tab: the photos query returns photos no matter how many videos were
+  /// sent after them.
+  ///
+  /// [onPage] fires with the merged, newest-first list after every page of
+  /// every source, so the grid fills in while the rest is still coming down.
+  Future<List<SavedMessageItem>> getSavedMessages({
+    int pageSize = 100,
+    int maxMessages = 20000,
+    void Function(List<SavedMessageItem> soFar)? onPage,
+  }) async {
     for (int attempt = 0; attempt < 2; attempt++) {
       try {
         await ensureConnected(force: attempt > 0);
-        final msgs = await _fetchSavedMessages(limit: limit);
+        final peer = await _resolveSelfPeer();
+        final byId = <int, SavedMessageItem>{};
+
+        void publish() {
+          final list = _sortedNewestFirst(byId.values);
+          _lastFetchedMessages = list;
+          onPage?.call(list);
+        }
+
+        void absorb(List<SavedMessageItem> items) {
+          var added = false;
+          for (final item in items) {
+            if (byId.containsKey(item.id)) continue;
+            byId[item.id] = item;
+            added = true;
+          }
+          if (added) publish();
+        }
+
+        // The two tabs that come up empty today are asked for first, so a
+        // photo or file lands on screen within a request or two instead of
+        // after the whole history walk — then the walk streams the rest in.
+        final categories = <MapEntry<String, t.MessagesFilterBase>>[
+          MapEntry('photos', const t.InputMessagesFilterPhotos()),
+          MapEntry('files', const t.InputMessagesFilterDocument()),
+          MapEntry('music', const t.InputMessagesFilterMusic()),
+          MapEntry('voice', const t.InputMessagesFilterVoice()),
+          MapEntry('gifs', const t.InputMessagesFilterGif()),
+          MapEntry('videos', const t.InputMessagesFilterVideo()),
+        ];
+
+        // A refused filter only costs that category while anything at all
+        // came back; the first failure is remembered so a load that got
+        // nothing at all can still end in an error the page can show.
+        Object? firstError;
+
+        Future<void> runCategory(MapEntry<String, t.MessagesFilterBase> c) async {
+          try {
+            await _searchFiltered(
+              c.value,
+              peer: peer,
+              pageSize: pageSize,
+              maxMessages: maxMessages,
+              onPage: absorb,
+            );
+          } catch (e) {
+            debugPrint('[TG] ${c.key} search failed: $e');
+            firstError ??= e;
+          }
+        }
+
+        // Photos and files first — those are the tabs the walk misses.
+        for (final category in categories.take(2)) {
+          await runCategory(category);
+        }
+
+        // Photos and files are already in hand at this point, so a walk that
+        // fails half way through shows what was gathered instead of wiping
+        // the grid — except for a dead session, which is worth failing the
+        // whole load over so the reauthenticate prompt can appear.
+        try {
+          await _fetchSavedMessages(
+            peer: peer,
+            pageSize: pageSize,
+            maxMessages: maxMessages,
+            onPage: absorb,
+          );
+        } catch (e) {
+          if (_isNonRetryable(e)) rethrow;
+          debugPrint('[TG] history walk failed: $e');
+          firstError ??= e;
+        }
+
+        // Everything else fills in behind the walk.
+        for (final category in categories.skip(2)) {
+          await runCategory(category);
+        }
+
+        if (byId.isEmpty && firstError != null) throw firstError!;
+
+        final msgs = _sortedNewestFirst(byId.values);
         _lastFetchedMessages = msgs;
         _hasSyncedMessages = true;
         _syncGeneration++;
@@ -707,6 +985,90 @@ class TelegramService extends ChangeNotifier {
     throw StateError('Failed to get saved messages');
   }
 
+  static List<SavedMessageItem> _sortedNewestFirst(
+          Iterable<SavedMessageItem> items) =>
+      items.toList()
+        ..sort((a, b) {
+          final byDate = b.date.compareTo(a.date);
+          // Two messages can share a second; a stable tie-break keeps the
+          // grid from reshuffling between publishes of the same data.
+          return byDate != 0 ? byDate : b.id.compareTo(a.id);
+        });
+
+  /// Pages one media category with `messages.search`: an empty query and a
+  /// type filter is how a client asks "give me the photos in this chat" and
+  /// gets them straight from the newest, without walking past everything
+  /// else first.
+  Future<void> _searchFiltered(
+    t.MessagesFilterBase filter, {
+    t.InputPeerBase? peer,
+    int pageSize = 100,
+    int maxMessages = 20000,
+    void Function(List<SavedMessageItem> soFar)? onPage,
+  }) async {
+    final target = peer ?? await _resolveSelfPeer();
+    final collected = <SavedMessageItem>[];
+    final seen = <int>{};
+    var offsetId = 1 << 30;
+
+    while (collected.length < maxMessages) {
+      final limit = (maxMessages - collected.length).clamp(1, pageSize);
+      final res = await _client!.messages.search(
+        peer: target,
+        q: '',
+        fromId: null,
+        savedPeerId: null,
+        savedReaction: null,
+        topMsgId: null,
+        filter: filter,
+        minDate: DateTime(1970),
+        maxDate: DateTime(2100),
+        offsetId: offsetId,
+        addOffset: 0,
+        limit: limit,
+        maxId: 0,
+        minId: 0,
+        hash: 0,
+      ).timeout(const Duration(seconds: 20));
+      if (res.error != null) {
+        final err = res.error;
+        if (err != null &&
+            err.errorCode == 401 &&
+            err.errorMessage == 'AUTH_KEY_UNREGISTERED') {
+          debugPrint('Auth key unregistered — clearing session');
+          await clearSession();
+          throw StateError('AUTH_KEY_UNREGISTERED');
+        }
+        throw Exception('Search failed: ${res.error}');
+      }
+
+      final raw = _rawMessages(res.result);
+      if (raw.isEmpty) break;
+
+      int? lowest;
+      for (final m in raw) {
+        final id = m is t.Message
+            ? m.id
+            : m is t.MessageEmpty
+                ? m.id
+                : null;
+        if (id != null && (lowest == null || id < lowest)) lowest = id;
+      }
+      if (lowest == null || lowest >= offsetId) break;
+
+      var added = 0;
+      for (final item in _parseMessagesBase(res.result)) {
+        if (seen.add(item.id)) {
+          collected.add(item);
+          added++;
+        }
+      }
+      if (added > 0) onPage?.call(List<SavedMessageItem>.of(collected));
+      if (raw.length < limit) break;
+      offsetId = lowest;
+    }
+  }
+
   Future<t.InputPeerBase> _resolveSelfPeer() async {
     final usersResult = await _client!.users.getUsers(id: [
       const t.InputUserSelf(),
@@ -723,64 +1085,105 @@ class TelegramService extends ChangeNotifier {
     return t.InputPeerSelf();
   }
 
-  Future<List<SavedMessageItem>> _fetchSavedMessages({int limit = 50}) async {
-    final peer = await _resolveSelfPeer();
+  /// Walks history backwards with `offsetId` until it runs out or
+  /// [maxMessages] is reached. Each page's ids are deduped against what is
+  /// already collected, so a server that overlaps two pages can never put the
+  /// same message in the grid twice.
+  Future<List<SavedMessageItem>> _fetchSavedMessages({
+    t.InputPeerBase? peer,
+    int pageSize = 100,
+    int maxMessages = 20000,
+    void Function(List<SavedMessageItem> soFar)? onPage,
+  }) async {
+    final chat = peer ?? await _resolveSelfPeer();
+    final collected = <SavedMessageItem>[];
+    final seen = <int>{};
+    var offsetId = 1 << 30;
+    // `getHistory` is not always allowed on this peer; the first failure
+    // switches every following page to `getSavedHistory` rather than paying
+    // for the same error on every request.
+    var useSavedHistory = false;
 
-    final historyResult = await _client!.messages.getHistory(
-      peer: peer,
-      offsetId: 1 << 30,
-      offsetDate: DateTime(1970),
-      addOffset: 0,
-      limit: limit,
-      maxId: 0,
-      minId: 0,
-      hash: 0,
-    );
+    while (collected.length < maxMessages) {
+      final limit = (maxMessages - collected.length).clamp(1, pageSize);
+      t.MessagesMessagesBase? base;
 
-    if (historyResult.error != null) {
-      debugPrint('getHistory failed: ${historyResult.error}');
-      final err = historyResult.error;
-      if (err != null && err.errorCode == 401 && err.errorMessage == 'AUTH_KEY_UNREGISTERED') {
-        debugPrint('Auth key unregistered — clearing session');
-        await clearSession();
-        throw StateError('AUTH_KEY_UNREGISTERED');
+      if (!useSavedHistory) {
+        final historyResult = await _client!.messages.getHistory(
+          peer: chat,
+          offsetId: offsetId,
+          offsetDate: DateTime(1970),
+          addOffset: 0,
+          limit: limit,
+          maxId: 0,
+          minId: 0,
+          hash: 0,
+        );
+        if (historyResult.error == null) {
+          base = historyResult.result;
+        } else {
+          debugPrint('getHistory failed: ${historyResult.error}');
+          final err = historyResult.error;
+          if (err != null &&
+              err.errorCode == 401 &&
+              err.errorMessage == 'AUTH_KEY_UNREGISTERED') {
+            debugPrint('Auth key unregistered — clearing session');
+            await clearSession();
+            throw StateError('AUTH_KEY_UNREGISTERED');
+          }
+          useSavedHistory = true;
+        }
       }
-      final savedResult = await _client!.messages.getSavedHistory(
-        peer: peer,
-        offsetId: 1 << 30,
-        offsetDate: DateTime(1970),
-        addOffset: 0,
-        limit: limit,
-        maxId: 0,
-        minId: 0,
-        hash: 0,
-      );
-      if (savedResult.error != null) {
-        throw Exception('Failed to get messages: ${savedResult.error}');
+
+      if (useSavedHistory) {
+        final savedResult = await _client!.messages.getSavedHistory(
+          peer: chat,
+          offsetId: offsetId,
+          offsetDate: DateTime(1970),
+          addOffset: 0,
+          limit: limit,
+          maxId: 0,
+          minId: 0,
+          hash: 0,
+        );
+        if (savedResult.error != null) {
+          throw Exception('Failed to get messages: ${savedResult.error}');
+        }
+        base = savedResult.result;
       }
-      debugPrint('getSavedHistory type: ${savedResult.result.runtimeType}');
-      return _parseMessagesBase(savedResult.result);
+
+      final raw = _rawMessages(base);
+      if (raw.isEmpty) break;
+
+      // The next page starts below the lowest id of this one. No progress
+      // means the server is repeating itself — stop rather than loop.
+      int? lowest;
+      for (final m in raw) {
+        final id = m is t.Message
+            ? m.id
+            : m is t.MessageEmpty
+                ? m.id
+                : null;
+        if (id != null && (lowest == null || id < lowest)) lowest = id;
+      }
+      if (lowest == null || lowest >= offsetId) break;
+
+      var added = 0;
+      for (final item in _parseMessagesBase(base)) {
+        if (seen.add(item.id)) {
+          collected.add(item);
+          added++;
+        }
+      }
+      debugPrint(
+          'history page: ${raw.length} raw, +$added (total ${collected.length})');
+      if (added > 0) onPage?.call(List<SavedMessageItem>.of(collected));
+
+      // A short page is the end of history.
+      if (raw.length < limit) break;
+      offsetId = lowest;
     }
-
-    debugPrint('getHistory type: ${historyResult.result.runtimeType}');
-    final base = historyResult.result;
-    if (base is t.MessagesMessages) {
-      debugPrint('getHistory: ${base.messages.length} messages');
-      for (final m in base.messages) {
-        debugPrint('  msg: ${m.runtimeType} id=${m is t.Message ? m.id : "?"} media=${m is t.Message ? m.media?.runtimeType : "?"}');
-      }
-    } else if (base is t.MessagesMessagesSlice) {
-      debugPrint('getHistory Slice: ${base.messages.length} messages, count=${base.count}');
-      for (final m in base.messages) {
-        debugPrint('  msg: ${m.runtimeType} id=${m is t.Message ? m.id : "?"} media=${m is t.Message ? m.media?.runtimeType : "?"}');
-      }
-    } else {
-      debugPrint('getHistory: ${base.runtimeType}');
-    }
-
-    final items = _parseMessagesBase(base);
-    debugPrint('parsed items: ${items.length}');
-    return items;
+    return collected;
   }
 
   List<SavedMessageItem> _parseMessagesBase(t.MessagesMessagesBase? base) {
@@ -974,6 +1377,38 @@ class TelegramService extends ChangeNotifier {
     return TelegramUploadVerdict(present: present, absent: absent);
   }
 
+  /// Deletes messages from Saved Messages — which is Telegram itself, not
+  /// just our copy of the list.
+  ///
+  /// Returns how many ids were sent; [deleteMessages] answers with an
+  /// `affectedMessages` count that does not tell us which of our ids landed,
+  /// so a successful RPC is taken as "these are gone". The fetch cache is
+  /// trimmed and the sync generation bumped so the queue page re-verifies its
+  /// badges against Telegram instead of trusting a list we already know is
+  /// stale.
+  Future<int> deleteMessages(List<int> ids) async {
+    final targets = _uniqueInts(ids);
+    if (targets.isEmpty) return 0;
+    await ensureConnected();
+    final res = await _client!.messages
+        .deleteMessages(revoke: false, id: targets)
+        .timeout(const Duration(seconds: 30));
+    if (res.error != null) {
+      throw Exception(
+          'Telegram ${res.error!.errorCode}: ${res.error!.errorMessage}');
+    }
+    _lastFetchedMessages.removeWhere((m) => targets.contains(m.id));
+    _syncGeneration++;
+    notifyListeners();
+    debugPrint('[TG] deleted ${targets.length} messages');
+    return targets.length;
+  }
+
+  static List<int> _uniqueInts(List<int> values) {
+    final seen = <int>{};
+    return [for (final v in values) if (seen.add(v)) v];
+  }
+
   bool _captionMatchesFetched(String title) {
     final needle = title.trim();
     if (needle.isEmpty) return true;
@@ -1044,7 +1479,6 @@ class TelegramService extends ChangeNotifier {
                   ? item.thumbSizes.first
                   : 's';
               if (item.thumbSizes.isEmpty) item.thumbSizes = ['s', 'm'];
-              debugPrint('Photo thumb: id=${photo.id} sizes=${photo.sizes.length} candidates=${item.thumbSizes}');
             } else {
               debugPrint('Photo not Photo type: ${photo.runtimeType}');
             }
@@ -1094,9 +1528,6 @@ class TelegramService extends ChangeNotifier {
                 item.thumbSizes = isVideo ? ['i', 's'] : ['s', 'i'];
               }
               item.thumbSize = item.thumbSizes.first;
-              debugPrint('Doc thumb: id=${doc.id} dc=${doc.dcId} '
-                  'thumbs=${doc.thumbs?.length} videoThumbs=${doc.videoThumbs?.length} '
-                  'candidates=${item.thumbSizes}');
             }
           }
           items.add(item);

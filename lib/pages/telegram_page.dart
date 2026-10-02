@@ -36,6 +36,7 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
   String? _error;
   final Set<int> _selectedIds = {};
   int _tabIndex = 0;
+  bool _deleting = false;
 
   /// Folder the grid is filtered to, or `null` for everything.
   String? _selectedFolderId;
@@ -85,17 +86,28 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
   }
 
   Future<void> _loadMessages() async {
-    setState(() { _loading = true; _error = null; _reauthRequired = false; });
+    setState(() {
+      _loading = true;
+      _error = null;
+      _reauthRequired = false;
+      // A sync can drop messages the user deleted in Telegram; rebuild the
+      // memo from what is actually coming in instead of the old list.
+      _thumbFutures.clear();
+      _thumbAttempts.clear();
+    });
     try {
-      final msgs = await widget.service.getSavedMessages(limit: 50);
+      final msgs = await widget.service.getSavedMessages(
+        // Every page lands in the grid as it arrives, so the newest messages
+        // are usable while history keeps streaming in underneath them.
+        onPage: (soFar) {
+          if (!mounted) return;
+          setState(() => _messages = soFar);
+        },
+      );
       if (!mounted) return;
       setState(() {
         _messages = msgs;
         _loading = false;
-        // A sync can drop messages the user deleted in Telegram; rebuild the
-        // memo from what is actually in the new list.
-        _thumbFutures.clear();
-        _thumbAttempts.clear();
       });
       WidgetsBinding.instance.addPostFrameCallback((_) => _prefetchThumbnails());
     } catch (e) {
@@ -150,14 +162,24 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
     return future;
   }
 
-  /// Warm the whole list while the grid scrolls, so swiping to another tab or
-  /// further down the page finds the bytes already in the cache.
+  /// Warm the newest tiles while the grid scrolls, so swiping to another tab
+  /// or further down the first screens finds the bytes already in the cache.
+  ///
+  /// Deliberately bounded: with the full history loaded this list can hold
+  /// thousands of messages, and prefetching every thumbnail at once would
+  /// fire thousands of downloads before the user has scrolled to any of them.
+  /// Tiles outside the window still load on demand as they scroll in.
+  static const int _prefetchLimit = 150;
+
   void _prefetchThumbnails() {
     if (!mounted) return;
+    var started = 0;
     for (final msg in _messages) {
+      if (started >= _prefetchLimit) break;
       if (msg.thumbnailId == null) continue;
       if (_thumbFutures.containsKey(msg.thumbnailId)) continue;
       _thumbFutures[msg.thumbnailId!] = widget.service.getThumbnail(msg);
+      started++;
     }
   }
 
@@ -279,6 +301,20 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
     return ['${msg.id}'];
   }
 
+  /// The long-press path for a multi-selection: one sheet to file every
+  /// picked tile at once, rather than dragging them one chip at a time.
+  Future<void> _moveSelectionToFolder() async {
+    final store = widget.folderStore;
+    if (store == null || _selectedIds.isEmpty) return;
+    await showMoveToFolderSheet(
+      context,
+      store: store,
+      scope: FolderScope.telegram,
+      itemIds: [for (final id in _selectedIds) '$id'],
+      currentFolderId: _selectedFolderId,
+    );
+  }
+
   Future<void> _downloadSelected() async {
     if (_selectedIds.isEmpty) return;
     final toDownload = _messages.where((m) => _selectedIds.contains(m.id)).toList();
@@ -310,6 +346,76 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
     }
   }
 
+  /// Removes the selection from Telegram itself, not just from the grid.
+  ///
+  /// The folder membership is dropped in the same pass: a message id that no
+  /// longer resolves can never be filtered or opened again, so keeping it
+  /// would only leave dead entries behind in the folder.
+  Future<void> _deleteSelected() async {
+    if (_selectedIds.isEmpty || _deleting) return;
+    final ids = _selectedIds.toList()..sort();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.grey[900],
+        title: const Text('Delete from Telegram?',
+            style: TextStyle(color: Colors.white)),
+        content: Text(
+          'Delete ${ids.length} item${ids.length == 1 ? '' : 's'} from your '
+          'Telegram Saved Messages. This cannot be undone.',
+          style: TextStyle(color: Colors.grey[400]),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('Delete', style: TextStyle(color: Colors.red[300])),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _deleting = true);
+    try {
+      final removed = _messages.where((m) => ids.contains(m.id)).toList();
+      await widget.service.deleteMessages(ids);
+      await widget.folderStore?.clearMembership(
+          FolderScope.telegram, [for (final id in ids) '$id']);
+      if (!mounted) return;
+      setState(() {
+        _messages.removeWhere((m) => ids.contains(m.id));
+        for (final m in removed) {
+          if (m.thumbnailId != null) {
+            _thumbFutures.remove(m.thumbnailId);
+            _thumbAttempts.remove(m.thumbnailId);
+          }
+        }
+        _selectedIds.clear();
+        _deleting = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(
+            'Deleted ${removed.length} item${removed.length == 1 ? '' : 's'} from Telegram'),
+      ));
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _deleting = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Delete failed: ${_friendly(e)}')),
+      );
+    }
+  }
+
+  String _friendly(Object e) {
+    const prefix = 'Bad state: ';
+    final s = e.toString();
+    return s.startsWith(prefix) ? s.substring(prefix.length) : s;
+  }
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
@@ -334,6 +440,27 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
               icon: const Icon(Icons.download, color: Colors.green),
               onPressed: _downloadSelected,
             ),
+          if (widget.service.isAuthenticated && _selectedIds.isNotEmpty)
+            IconButton(
+              icon: _deleting
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(
+                          strokeWidth: 2, color: Colors.redAccent))
+                  : const Icon(Icons.delete, color: Colors.redAccent),
+              tooltip: 'Delete from Telegram',
+              onPressed: _deleting ? null : _deleteSelected,
+            ),
+          // The media filters moved up here from their own row: one letter
+          // each (V/P/F) keeps all three narrow enough to live in the bar,
+          // and the grid gets the full height the old row used to eat. Only
+          // shown once there is something to filter.
+          if (_messages.isNotEmpty) ...[
+            _buildAppBarTab(0, 'V', _visibleVideos.length),
+            _buildAppBarTab(1, 'P', _visibleImages.length),
+            _buildAppBarTab(2, 'F', _visibleFiles.length),
+          ],
           if (widget.service.isAuthenticated)
             IconButton(
               icon: const Icon(Icons.refresh),
@@ -368,11 +495,17 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
       );
     }
 
-    if (_loading) {
+    // History is filled in page by page, so the full-screen spinner only
+    // applies before the first page lands; after that the grid stays up and
+    // a slim bar shows the rest is still coming.
+    if (_loading && _messages.isEmpty) {
       return const Center(child: CircularProgressIndicator(color: Colors.blue));
     }
 
-    if (_error != null) {
+    // A re-auth can only be answered from the full-screen prompt; a plain
+    // fetch error over a half-filled grid just gets a banner so the messages
+    // that did arrive stay usable.
+    if (_error != null && (_messages.isEmpty || _reauthRequired)) {
       final bool reauth = _reauthRequired;
       return Center(
         child: Column(
@@ -427,6 +560,20 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
 
     return Column(
       children: [
+        if (_loading)
+          const LinearProgressIndicator(
+              minHeight: 2, color: Colors.blue, backgroundColor: Colors.grey),
+        if (_error != null && _messages.isNotEmpty)
+          Container(
+            width: double.infinity,
+            color: Colors.red[900],
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            child: Text(
+              '${_friendly(_error!)} — showing what loaded so far',
+              style: TextStyle(color: Colors.red[100], fontSize: 11),
+              textAlign: TextAlign.center,
+            ),
+          ),
         if (widget.folderStore != null)
           FolderStrip(
             store: widget.folderStore!,
@@ -437,47 +584,45 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
               _selectedIds.clear();
             }),
           ),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-          child: Row(
-            children: [
-              _buildTab(0, 'Videos', _visibleVideos.length, Icons.videocam),
-              const SizedBox(width: 8),
-              _buildTab(1, 'Images', _visibleImages.length, Icons.image),
-              const SizedBox(width: 8),
-              _buildTab(2, 'Files', _visibleFiles.length, Icons.insert_drive_file),
-            ],
-          ),
-        ),
         Expanded(child: _buildGrid()),
       ],
     );
   }
 
-  Widget _buildTab(int index, String label, int count, IconData icon) {
+  /// One media filter in the app bar: a single letter (V/P/F) with the full
+  /// name and the live count of what the grid would show as its tooltip.
+  /// Switching tabs drops the selection — those ids belong to the list that
+  /// was on screen.
+  Widget _buildAppBarTab(int index, String letter, int count) {
+    const labels = ['Videos', 'Images', 'Files'];
     final selected = _tabIndex == index;
-    return Expanded(
-      child: GestureDetector(
-        onTap: () => setState(() { _tabIndex = index; _selectedIds.clear(); }),
-        child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 10),
-          decoration: BoxDecoration(
-            color: selected ? Colors.blue : Colors.grey[900],
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, size: 16, color: selected ? Colors.white : Colors.grey),
-              const SizedBox(width: 6),
-              Text(label, style: TextStyle(color: selected ? Colors.white : Colors.grey, fontSize: 13, fontWeight: FontWeight.w600)),
-              const SizedBox(width: 4),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                decoration: BoxDecoration(color: selected ? Colors.white24 : Colors.grey[800], borderRadius: BorderRadius.circular(8)),
-                child: Text('$count', style: TextStyle(color: selected ? Colors.white : Colors.grey, fontSize: 10)),
-              ),
-            ],
+    return Padding(
+      padding: const EdgeInsets.only(right: 4),
+      child: Tooltip(
+        message: '${labels[index]} ($count)',
+        child: GestureDetector(
+          onTap: () => setState(() {
+            _tabIndex = index;
+            _selectedIds.clear();
+          }),
+          behavior: HitTestBehavior.opaque,
+          child: Container(
+            width: 26,
+            height: 26,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: selected ? Colors.blue : Colors.grey[900],
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                  color: selected ? Colors.blue : Colors.grey[700]!),
+            ),
+            child: Text(
+              letter,
+              style: TextStyle(
+                  color: selected ? Colors.white : Colors.grey[400],
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold),
+            ),
           ),
         ),
       ),
@@ -526,6 +671,11 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
         itemBuilder: (_, i) {
           final msg = items[i];
           final selected = _selectedIds.contains(msg.id);
+          // A long-press either drags a tile onto a folder chip or asks where
+          // the whole selection should go — never both, since the two would
+          // fight over the same gesture. With several tiles picked, moving
+          // the selection is what the gesture is for.
+          final moveSelection = _selectedIds.length > 1 && selected;
           final tile = GestureDetector(
             onTap: () {
               setState(() {
@@ -541,6 +691,7 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
                         msg.mediaType == SavedMediaType.photo)
                     ? () => _openItem(msg)
                     : null,
+            onLongPress: moveSelection ? _moveSelectionToFolder : null,
             child: Stack(
               children: [
                 Container(
@@ -590,13 +741,29 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
                       ),
                       Padding(
                         padding: const EdgeInsets.all(4),
-                        child: Text(
-                          msg.caption != null && msg.caption!.isNotEmpty
-                              ? msg.caption!
-                              : dateFmt.format(msg.date),
-                          style: const TextStyle(color: Colors.white, fontSize: 10),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            if (widget.folderStore != null &&
+                                hasFolderTags(widget.folderStore!,
+                                    FolderScope.telegram, '${msg.id}')) ...[
+                              FolderTags(
+                                store: widget.folderStore!,
+                                scope: FolderScope.telegram,
+                                itemId: '${msg.id}',
+                              ),
+                              const SizedBox(height: 3),
+                            ],
+                            Text(
+                              msg.caption != null && msg.caption!.isNotEmpty
+                                  ? msg.caption!
+                                  : dateFmt.format(msg.date),
+                              style: const TextStyle(
+                                  color: Colors.white, fontSize: 10),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
                         ),
                       ),
                     ],
@@ -656,6 +823,7 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
               ],
             ),
           );
+          if (moveSelection) return tile;
           return LongPressDraggable<List<String>>(
             data: _dragPayload(msg),
             feedback: Material(

@@ -351,6 +351,20 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
     );
   }
 
+  /// The long-press path for a multi-selection: one sheet files every picked
+  /// video at once, instead of dragging them onto chips one by one.
+  Future<void> _moveSelectionToFolder() async {
+    final store = widget.folderStore;
+    if (store == null || _selectedIds.isEmpty) return;
+    await showMoveToFolderSheet(
+      context,
+      store: store,
+      scope: FolderScope.youtube,
+      itemIds: [..._selectedIds],
+      currentFolderId: _selectedFolderId,
+    );
+  }
+
   Future<void> _downloadSelected() async {
     if (_selectedIds.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -564,6 +578,11 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
                       }
                       final v = filtered[i];
                       final selected = _selectedIds.contains(v.id);
+                      // One long-press, one job: with several tiles picked it
+                      // opens "move selected to folders", otherwise it drags
+                      // the single tile onto a chip.
+                      final moveSelection =
+                          _selectedIds.length > 1 && selected;
                       final tile = GestureDetector(
                         onTap: () {
                           setState(() {
@@ -575,6 +594,8 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
                           });
                         },
                         onDoubleTap: () => _openVideo(v),
+                        onLongPress:
+                            moveSelection ? _moveSelectionToFolder : null,
                         child: Stack(
                           children: [
                             Container(
@@ -593,9 +614,25 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
                                   ),
                                   Padding(
                                     padding: const EdgeInsets.all(4),
-                                    child: Text(v.title,
-                                        style: const TextStyle(color: Colors.white, fontSize: 10),
-                                        maxLines: 2, overflow: TextOverflow.ellipsis),
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        if (widget.folderStore != null &&
+                                            hasFolderTags(widget.folderStore!,
+                                                FolderScope.youtube, v.id)) ...[
+                                          FolderTags(
+                                            store: widget.folderStore!,
+                                            scope: FolderScope.youtube,
+                                            itemId: v.id,
+                                          ),
+                                          const SizedBox(height: 3),
+                                        ],
+                                        Text(v.title,
+                                            style: const TextStyle(color: Colors.white, fontSize: 10),
+                                            maxLines: 2, overflow: TextOverflow.ellipsis),
+                                      ],
+                                    ),
                                   ),
                                 ],
                               ),
@@ -628,6 +665,7 @@ class _YoutubeBrowserPageState extends State<YoutubeBrowserPage> with AutomaticK
                           ],
                         ),
                       );
+                      if (moveSelection) return tile;
                       return LongPressDraggable<List<String>>(
                         data: selected
                             ? [for (final id in _selectedIds) id]

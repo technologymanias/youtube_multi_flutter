@@ -35,7 +35,10 @@ Future<void> updateBadgeCount(int count) async {
     } catch (_) {}
   } else {
     try {
-      FlutterAppBadger.removeBadge();
+      // Awaited, like the branch above: an unawaited plugin call leaves its
+      // error uncaught the moment the badge is cleared on a platform where
+      // the plugin does nothing.
+      await FlutterAppBadger.removeBadge();
     } catch (_) {}
   }
 }
