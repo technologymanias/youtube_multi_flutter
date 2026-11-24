@@ -149,23 +149,27 @@ void main() {
         () async {
       final before = freshSync();
       await before.init();
-      // A fresh install: master off (nothing queues itself unasked), every
-      // category on (an upgrade must not silently stop a sync).
+      // A fresh install: master off and every category off — nothing
+      // queues itself unasked, and a category only runs once its stored
+      // state says on.
       expect(before.enabled, isFalse);
-      expect(before.targetEnabled(SyncTarget.telegramPhotos), isTrue);
+      for (final target in SyncTarget.values) {
+        expect(before.targetEnabled(target), isFalse, reason: target.name);
+      }
 
       await before.setEnabled(true);
+      await before.setTargetEnabled(SyncTarget.telegramVideos, true);
+      await before.setTargetEnabled(SyncTarget.youtubeVideos, true);
       await before.setTargetEnabled(SyncTarget.telegramPhotos, false);
-      await before.setTargetEnabled(SyncTarget.youtubeVideos, false);
       before.dispose();
 
       final after = freshSync();
       await after.init();
       expect(after.enabled, isTrue);
       expect(after.targetEnabled(SyncTarget.telegramVideos), isTrue);
+      expect(after.targetEnabled(SyncTarget.youtubeVideos), isTrue);
       expect(after.targetEnabled(SyncTarget.telegramPhotos), isFalse);
-      expect(after.targetEnabled(SyncTarget.telegramFiles), isTrue);
-      expect(after.targetEnabled(SyncTarget.youtubeVideos), isFalse);
+      expect(after.targetEnabled(SyncTarget.telegramFiles), isFalse);
       after.dispose();
     });
 
@@ -174,6 +178,12 @@ void main() {
       final before = freshSync();
       await before.init();
       await before.setEnabled(true);
+      // Turn every category on first — the state a user would have chosen
+      // — then off again: that choice must survive the restart instead of
+      // being reset to the (off) default.
+      for (final target in SyncTarget.values) {
+        await before.setTargetEnabled(target, true);
+      }
       for (final target in SyncTarget.values) {
         await before.setTargetEnabled(target, false);
       }
@@ -195,12 +205,12 @@ void main() {
       var notifications = 0;
       sync.addListener(() => notifications++);
 
-      // Target defaults to on, so turning it on again changes nothing and
-      // must not notify (or touch storage).
-      await sync.setTargetEnabled(SyncTarget.telegramVideos, true);
+      // Targets default to off, so turning one off again changes nothing
+      // and must not notify (or touch storage).
+      await sync.setTargetEnabled(SyncTarget.telegramVideos, false);
       expect(notifications, 0);
 
-      await sync.setTargetEnabled(SyncTarget.telegramVideos, false);
+      await sync.setTargetEnabled(SyncTarget.telegramVideos, true);
       expect(notifications, 1);
       sync.dispose();
     });

@@ -115,9 +115,9 @@ class MasterSync extends ChangeNotifier {
   final Map<SyncTarget, MasterSyncResult> _lastTargetResults = {};
   final Map<SyncTarget, DateTime> _lastTargetRuns = {};
 
-  /// Categories switched off. Everything starts on, so upgrading never
-  /// silently stops a sync the user was relying on.
-  final Set<SyncTarget> _disabledTargets = {};
+  /// Categories switched off. Everything starts off, so nothing is ever
+  /// synced by default — a category only runs once its saved state says on.
+  final Set<SyncTarget> _disabledTargets = Set.of(SyncTarget.values);
 
   /// Set on dispose so an in-flight pass cannot notify a dead listener —
   /// a sync spans platform calls that outlive the shell if the app is closed
@@ -160,12 +160,18 @@ class MasterSync extends ChangeNotifier {
       _enabled = prefs.getBool(_prefsKey) ?? false;
       _disabledTargets.clear();
       for (final target in SyncTarget.values) {
-        final on = prefs.getBool('$_targetPrefsPrefix${target.name}') ?? true;
+        // Off unless the stored state says on: a category only syncs when
+        // the user has actually turned it on, and that choice is kept.
+        final on = prefs.getBool('$_targetPrefsPrefix${target.name}') ?? false;
         if (!on) _disabledTargets.add(target);
       }
     } catch (e) {
       debugPrint('[MasterSync] could not read stored state: $e');
       _enabled = false;
+      // The stored state could not be read, so nothing may claim to be on.
+      _disabledTargets
+        ..clear()
+        ..addAll(SyncTarget.values);
     }
     _restartTimer();
     _notify();
@@ -174,8 +180,9 @@ class MasterSync extends ChangeNotifier {
     if (_enabled) unawaited(syncNow());
   }
 
-  /// Whether [target] is switched on. Categories default to on, so a fresh
-  /// install syncs everything exactly as it did before the toggles existed.
+  /// Whether [target] is switched on. Categories default to off: only a
+  /// saved "on" state turns one on, so a fresh install syncs nothing until
+  /// a toggle is switched on.
   bool targetEnabled(SyncTarget target) => !_disabledTargets.contains(target);
 
   /// Turns one category's toggle on or off and persists it. Off means the

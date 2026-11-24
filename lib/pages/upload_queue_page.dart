@@ -14,6 +14,8 @@ import '../services/telegram_service.dart';
 import '../services/youtube_sync.dart';
 import '../services/folder_store.dart';
 import 'folder_strip.dart';
+import 'local_photo_viewer.dart';
+import 'phone_data_bar_buttons.dart';
 import 'reel_player_page.dart';
 
 class UploadQueuePage extends StatefulWidget {
@@ -1039,6 +1041,9 @@ class _UploadQueuePageState extends State<UploadQueuePage>
           _buildAppBarTab(0, 'V', videoCount),
           _buildAppBarTab(1, 'P', photoCount),
           _buildAppBarTab(2, 'F', fileCount),
+          // Phone-data screens (C/L/N/T) next to the media filters: each
+          // letter pushes its own list — contacts, call logs, notes, texts.
+          ...phoneDataBarButtons(context, accent: Colors.green),
           IconButton(
             icon: const Icon(Icons.queue_rounded),
             onPressed: () => _setShowPicker(false),
@@ -1117,15 +1122,12 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                       // picked. One long-press cannot be both.
                       final moveSelection =
                           _selectedForQueue.length > 1 && selected;
-                      // Selection is gated on still having somewhere to send
-                      // the tile, not on "has any job at all": a video whose
-                      // Telegram copy was deleted, or that is queued for
-                      // Telegram only, still has an upload left to do.
-                      final queueable = _canQueue(v, UploadDestination.youtube) ||
-                          _canQueue(v, UploadDestination.telegram);
+                      // Selection is open on every tile — queued, uploaded
+                      // or untouched — so folders and delete work across the
+                      // whole library; the queue button still counts only
+                      // what could really get another job.
                       final tile = GestureDetector(
                         onTap: () {
-                          if (!queueable) return;
                           setState(() {
                             if (selected) {
                               _selectedForQueue.remove(v);
@@ -1137,25 +1139,39 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                         onLongPress:
                             moveSelection ? _moveSelectionToFolder : null,
                         onDoubleTap: () {
-                          if (inQueue) return;
                           // The grid is filtered per tab while the player is
                           // given one list — the index has to come from that
-                          // exact list or the reel opens on a photo/audio file
-                          // and spins forever.
-                          if (v.type != AssetType.video) return;
-                          final reel = filtered
-                              .where((x) => x.type == AssetType.video)
-                              .toList();
-                          final reelIndex = reel.indexOf(v);
-                          if (reelIndex < 0) return;
-                          Navigator.of(context).push(
-                            MaterialPageRoute(
-                              builder: (_) => ReelPlayerPage(
-                                videos: reel,
-                                initialIndex: reelIndex,
+                          // exact list or the viewer opens on the wrong item.
+                          // Queue/YT/TG state never blocks opening a tile.
+                          if (v.type == AssetType.video) {
+                            final reel = filtered
+                                .where((x) => x.type == AssetType.video)
+                                .toList();
+                            final reelIndex = reel.indexOf(v);
+                            if (reelIndex < 0) return;
+                            Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) => ReelPlayerPage(
+                                  videos: reel,
+                                  initialIndex: reelIndex,
+                                ),
                               ),
-                            ),
-                          );
+                            );
+                          } else if (v.type == AssetType.image) {
+                            final photos = filtered
+                                .where((x) => x.type == AssetType.image)
+                                .toList();
+                            final photoIndex = photos.indexOf(v);
+                            if (photoIndex < 0) return;
+                            Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (_) => LocalPhotoViewer(
+                                  photos: photos,
+                                  initialIndex: photoIndex,
+                                ),
+                              ),
+                            );
+                          }
                         },
                         child: Stack(
                           children: [
@@ -1204,7 +1220,7 @@ class _UploadQueuePageState extends State<UploadQueuePage>
                                   itemId: v.id,
                                 ),
                               ),
-                            if (selected && !inQueue)
+                            if (selected)
                               Container(
                                 decoration: BoxDecoration(
                                   color: Colors.black38,

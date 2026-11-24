@@ -6,6 +6,7 @@ import 'package:intl/intl.dart';
 import '../services/telegram_service.dart';
 import '../services/folder_store.dart';
 import 'folder_strip.dart';
+import 'phone_data_bar_buttons.dart';
 import 'telegram_auth_page.dart';
 import 'telegram_photo_viewer.dart';
 import 'telegram_reel_player.dart';
@@ -461,6 +462,10 @@ class _TelegramPageState extends State<TelegramPage> with AutomaticKeepAliveClie
             _buildAppBarTab(1, 'P', _visibleImages.length),
             _buildAppBarTab(2, 'F', _visibleFiles.length),
           ],
+          // Phone-data screens (C/L/N/T) beside the VPF filters — same
+          // letter buttons as the Local page, blue to match this bar. Each
+          // pushes its own list screen.
+          ...phoneDataBarButtons(context, accent: Colors.blue),
           if (widget.service.isAuthenticated)
             IconButton(
               icon: const Icon(Icons.refresh),

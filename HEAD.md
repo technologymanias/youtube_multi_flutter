@@ -3,7 +3,7 @@
 > Living status document. Updated at the end of every phase of work.
 > Legend: ✅ done · 🔧 in progress · ⏳ pending · ❌ blocked · 🗑 removed
 
-**Last updated:** 2026-10-02 — Phases 0–7 complete. `flutter analyze` clean
+**Last updated:** 2026-10-31 — Phone-data C/L/N/T shells ready. `flutter analyze` clean
 (7 pre-existing issues), **83/83 tests pass**.
 
 ---
@@ -113,6 +113,18 @@ interrupted run resumes without double-charging).
 - ✅ Folders scoped `local` / `youtube` / `telegram`, colour, drag-drop, export/import
 - ✅ Folder-strip chips shared across all three grids
 - ❌ Local media database — **never existed**; metadata is JSON blobs only
+
+### Phone-data screens (C/L/N/T) — shells ready
+- ✅ `lib/services/phone_data_service.dart` — `PhoneDataKind` (contacts/logs/notes/texts),
+  `PhoneDataItem`, `PhoneDataService` with a pluggable `reader` hook (empty until connected)
+- ✅ `lib/pages/phone_data_list_page.dart` — selectable list screen per category,
+  empty-state until a phone-data reader is plugged in
+- ✅ `lib/pages/phone_data_bar_buttons.dart` — shared C/L/N/T letter buttons
+- ✅ Local picker app bar: C/L/N/T after the V/P/F filters (green accent)
+- ✅ Telegram app bar: C/L/N/T after the V/P/F filters (blue accent)
+- ⏳ Real readers (contacts / call-log / notes / SMS sources) + upload flow —
+  user will specify source files and upload targets next
+
 
 ### Auto sync
 - ✅ `MasterSync` 15-minute timer, 4 targets, master + per-target toggles
@@ -250,6 +262,10 @@ photo_manager (device gallery)
 
 ## Changelog
 
+- **2026-10-31** Phone-data shells — C/L/N/T letter buttons added next to the
+  V/P/F media filters on both the Local picker and Telegram app bars; shared
+  `PhoneDataListPage` + `PhoneDataService` (pluggable reader hook, empty lists
+  until the phone-data sources and upload targets are specified).
 - **2026-10-02** Phases 0–7 — `HEAD.md`; UUID registry (`media_index.dart`);
   `UploadJob.uuid` + legacy migration; tag embedded in YouTube titles and
   Telegram captions; `videos.update` + `youtube` OAuth scope;
